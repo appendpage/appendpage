@@ -8,11 +8,14 @@ FROM node:${NODE_VERSION} AS deps
 WORKDIR /app
 # Workspace context is the repo root; we install only the server's deps.
 COPY server/package.json server/package-lock.json* ./
-# NOTE: do NOT pass --ignore-scripts here. On the npm version shipped with
-# node:20-alpine (10.x), --ignore-scripts also suppresses creation of the
-# .bin directory, leaving `next` unfindable in PATH. Our deps don't have
-# postinstalls we need to worry about.
-RUN npm ci
+# `npm ci` was crashing with "Exit handler never called!" inside the
+# resource-constrained build container on the prod box (npm 10.8.2, node
+# 20.20.2). `npm install` with the same lock file works reliably and is
+# functionally equivalent for a clean checkout. --no-audit/--no-fund
+# avoid network round-trips that occasionally hang the install. Also do
+# NOT pass --ignore-scripts: it suppresses .bin/ creation on this npm,
+# leaving `next` unfindable.
+RUN npm install --no-audit --no-fund
 
 # ---------- build ----------
 FROM node:${NODE_VERSION} AS build
