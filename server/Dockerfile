@@ -32,7 +32,6 @@ RUN addgroup -S appendpage && adduser -S appendpage -G appendpage
 # `process.cwd()/../AGENTS.md` resolves to the repo-root copy we placed at /AGENTS.md.
 COPY --from=build --chown=appendpage:appendpage /app/.next/standalone /app/
 COPY --from=build --chown=appendpage:appendpage /app/.next/static /app/.next/static
-COPY --from=build --chown=appendpage:appendpage /app/public /app/public 2>/dev/null || true
 # Repo-root files used by the markdown routes — colocated next to /app/server
 # so the route handlers resolve them via process.cwd()/../AGENTS.md.
 COPY --from=build --chown=appendpage:appendpage /AGENTS.md /AGENTS.md
@@ -41,11 +40,11 @@ COPY --from=build --chown=appendpage:appendpage /docs /docs
 COPY --chown=appendpage:appendpage migrations /migrations
 COPY --chown=appendpage:appendpage server/scripts /app/scripts
 
-# The standalone output puts the server entrypoint at /app/server.js since the
-# Next.js project lives in ./server/ — it'll be /app/server/server.js. Verify
-# at build time with `npm run build` and tweak if Next changes paths.
+# Next.js standalone output places the entry at /app/server.js (verified at
+# build time by inspecting the image; Next 15.5 with `output: "standalone"`
+# from a server/ subdirectory still flattens to top-level server.js).
 USER appendpage
 EXPOSE 3000
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
-CMD ["node", "server/server.js"]
+CMD ["node", "server.js"]

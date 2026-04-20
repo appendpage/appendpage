@@ -159,58 +159,86 @@ step_install_certbot() {
   apt-get install -y -qq certbot
 }
 
-step_obtain_cert() {
-  if [[ -d "/etc/letsencrypt/live/$DOMAIN" ]]; then
-    log "certbot cert for $DOMAIN already present — skipping issuance"
-    return
-  fi
-  log "obtaining certbot cert for $DOMAIN and $WWW_DOMAIN via webroot"
-  # First-time issuance needs nginx serving HTTP-01 from $ACME_WEBROOT, which
-  # requires our server block to be live. We chicken-and-egg this by:
-  #   1) Drop a minimal nginx server block that only handles ACME challenge.
-  #   2) Reload nginx, run certbot, then drop the full server block.
-  # For simplicity, we instead require the operator to run this step manually
-  # the first time:
-  warn "to obtain the cert, run:  certbot certonly --webroot -w $ACME_WEBROOT -d $DOMAIN -d $WWW_DOMAIN"
-  warn "(after the nginx HTTP-only block from this script's first iteration is in place)"
-}
+# ----------------------------------------------------------------------------
+# nginx & TLS provisioning is a chicken-and-egg dance:
+#
+#   * The full append.page.conf references /etc/letsencrypt/live/append.page/.
+#     If we install it before the cert exists, `nginx -t` fails and we abort.
+#   * certbot --webroot needs nginx already serving the ACME HTTP-01 challenge
+#     for our domain.
+#
+# Resolution: install append.page.http-only.conf first (HTTP-only, just the
+# ACME endpoint + 503 placeholder). Run certbot. Then swap in the full config.
+#
+# Both functions are idempotent and safe to re-run.
+# ----------------------------------------------------------------------------
 
-step_install_nginx_block() {
-  local src="$COMPOSE_PROJECT_DIR/infra/nginx/append.page.conf"
-  [[ -f "$src" ]] || fail "expected nginx config at $src"
-
-  log "installing $NGINX_CONF"
-  install -o root -g root -m 644 "$src" "$NGINX_CONF"
-
-  # Ensure /etc/nginx/nginx.conf includes /etc/nginx/conf.d/*.conf.
-  # Inspection on 2026-04-20 showed that line was present but commented out.
+ensure_nginx_includes_conf_d() {
+  # Idempotent: ensure /etc/nginx/nginx.conf includes /etc/nginx/conf.d/*.conf.
+  # Inspection on 2026-04-20 showed the line is present but commented out.
   if grep -qE '^\s*include\s+/etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf; then
-    log "nginx.conf already includes /etc/nginx/conf.d/*.conf"
-  elif grep -qE '^\s*#\s*include\s+/etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf; then
+    return 0
+  fi
+  if grep -qE '^\s*#\s*include\s+/etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf; then
     log "uncommenting 'include /etc/nginx/conf.d/*.conf;' in /etc/nginx/nginx.conf"
-    # backup first
     cp -a /etc/nginx/nginx.conf "/etc/nginx/nginx.conf.appendpage-bak.$(date +%s)"
     sed -i -E 's|^\s*#\s*include\s+/etc/nginx/conf.d/\*\.conf;|\tinclude /etc/nginx/conf.d/*.conf;|' \
       /etc/nginx/nginx.conf
   else
     warn "no 'include /etc/nginx/conf.d/*.conf;' line found in nginx.conf — adding one"
     cp -a /etc/nginx/nginx.conf "/etc/nginx/nginx.conf.appendpage-bak.$(date +%s)"
-    # Insert just before the closing brace of the http block. Last line that is
-    # a lone '}' at column 0.
     awk '
       /^}\s*$/ && !done { print "\tinclude /etc/nginx/conf.d/*.conf;"; done=1 }
       { print }
     ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.new
     mv /etc/nginx/nginx.conf.new /etc/nginx/nginx.conf
   fi
+}
 
+reload_nginx() {
   log "validating nginx config"
   if ! nginx -t; then
     fail "nginx -t failed; refusing to reload. Investigate and re-run."
   fi
-
   log "reloading nginx"
   systemctl reload nginx
+}
+
+step_install_nginx_http_only() {
+  # Always install the http-only config first. If we already have a cert,
+  # the next step replaces it with the full config.
+  local src="$COMPOSE_PROJECT_DIR/infra/nginx/append.page.http-only.conf"
+  [[ -f "$src" ]] || fail "expected nginx config at $src"
+  log "installing HTTP-only nginx block: $NGINX_CONF"
+  install -o root -g root -m 644 "$src" "$NGINX_CONF"
+  ensure_nginx_includes_conf_d
+  reload_nginx
+}
+
+step_obtain_cert() {
+  if [[ -d "/etc/letsencrypt/live/$DOMAIN" ]]; then
+    log "certbot cert for $DOMAIN already present — skipping issuance"
+    return
+  fi
+  log "obtaining TLS cert for $DOMAIN and $WWW_DOMAIN via certbot --webroot"
+  certbot certonly \
+    --webroot -w "$ACME_WEBROOT" \
+    -d "$DOMAIN" -d "$WWW_DOMAIN" \
+    --non-interactive --agree-tos \
+    --email "${CERTBOT_EMAIL:-da03@yuntiandeng.com}" \
+    --no-eff-email
+  if [[ ! -d "/etc/letsencrypt/live/$DOMAIN" ]]; then
+    fail "certbot succeeded? expected /etc/letsencrypt/live/$DOMAIN to exist"
+  fi
+}
+
+step_install_nginx_full() {
+  local src="$COMPOSE_PROJECT_DIR/infra/nginx/append.page.conf"
+  [[ -f "$src" ]] || fail "expected nginx config at $src"
+  log "installing full HTTPS nginx block: $NGINX_CONF"
+  install -o root -g root -m 644 "$src" "$NGINX_CONF"
+  ensure_nginx_includes_conf_d
+  reload_nginx
 }
 
 step_compose_up() {
@@ -261,11 +289,14 @@ step_clone_or_update_source
 log "==> install certbot"
 step_install_certbot
 
-log "==> install nginx block"
-step_install_nginx_block
+log "==> install HTTP-only nginx block (so ACME challenge works)"
+step_install_nginx_http_only
 
-log "==> obtain TLS cert (manual on first run)"
+log "==> obtain TLS cert via certbot --webroot"
 step_obtain_cert
+
+log "==> install full HTTPS nginx block"
+step_install_nginx_full
 
 log "==> bring up compose stack"
 step_compose_up
