@@ -8,7 +8,11 @@ FROM node:${NODE_VERSION} AS deps
 WORKDIR /app
 # Workspace context is the repo root; we install only the server's deps.
 COPY server/package.json server/package-lock.json* ./
-RUN npm ci --ignore-scripts
+# NOTE: do NOT pass --ignore-scripts here. On the npm version shipped with
+# node:20-alpine (10.x), --ignore-scripts also suppresses creation of the
+# .bin directory, leaving `next` unfindable in PATH. Our deps don't have
+# postinstalls we need to worry about.
+RUN npm ci
 
 # ---------- build ----------
 FROM node:${NODE_VERSION} AS build
