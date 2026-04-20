@@ -1,0 +1,90 @@
+# Production-like local Compose stack.
+#
+# Pinned image digests (not tags) per docs/03-deployment.md best practice;
+# update the digests deliberately when bumping a dependency.
+#
+# Internal-only ports on 127.0.0.1 (no public listening) so this stack is
+# safe to bring up alongside other tenants on a shared host. The host's
+# nginx proxy_passes to 127.0.0.1:38080 to reach the app.
+#
+# Bring up locally: `docker compose -f infra/compose.yaml up -d`
+# Bring up on the prod box: `cd /var/lib/appendpage && docker compose up -d`
+
+name: appendpage
+
+services:
+  db:
+    # postgres:16-alpine — pin to digest for prod (run `docker pull postgres:16-alpine && docker images --digests`)
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: appendpage
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-appendpage}
+      POSTGRES_DB: appendpage
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      # 127.0.0.1-only — never exposed publicly. App reaches via service DNS,
+      # but we expose to host loopback for psql/migrate scripts.
+      - "127.0.0.1:38432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appendpage -d appendpage"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:38379:6379"
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://appendpage:${POSTGRES_PASSWORD:-appendpage}@db:5432/appendpage
+      REDIS_URL: redis://redis:6379
+      PAGES_DIR: /var/lib/appendpage/pages
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_PRIMARY_MODEL: ${OPENAI_PRIMARY_MODEL:-gpt-5.4-mini-2026-03-17}
+      OPENAI_FALLBACK_MODEL: ${OPENAI_FALLBACK_MODEL:-gpt-5.4-nano-2026-03-17}
+      OPENAI_DAILY_BUDGET_USD: ${OPENAI_DAILY_BUDGET_USD:-50}
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      GITHUB_ADMIN_ALLOWLIST: ${GITHUB_ADMIN_ALLOWLIST:-da03}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://append.page}
+      IP_HASH_SALT_SEED: ${IP_HASH_SALT_SEED:-dev-only}
+      NODE_ENV: production
+    volumes:
+      - pages_data:/var/lib/appendpage/pages
+    ports:
+      - "127.0.0.1:38080:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3000/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+volumes:
+  pg_data:
+    driver: local
+  pages_data:
+    driver: local

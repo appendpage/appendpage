@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  verify-py-self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install jcs
+      - run: |
+          # Smoke-test verify.py against a hand-crafted golden JSONL.
+          # Builds a 3-entry chain with known hashes and confirms verify.py exits 0.
+          python - <<'PY'
+          import hashlib, json, subprocess, tempfile, os
+          import jcs as _jcs
+
+          def sha(b): return "sha256:" + hashlib.sha256(b).hexdigest()
+          def canon(o): return _jcs.canonicalize(o)
+
+          slug = "test"
+          created = "2026-04-20T00:00:00.000Z"
+          prev = sha(f"genesis|{slug}|{created}".encode())
+          entries = []
+          for i in range(3):
+              base = {
+                  "id": f"01H{'A'*23}{i}"[:26],
+                  "page": slug,
+                  "seq": i,
+                  "kind": "entry",
+                  "parent": None,
+                  "body_commitment": sha(b"\x00"*32 + f"body{i}".encode()),
+                  "created_at": created,
+                  "prev_hash": prev,
+              }
+              h = sha(canon(base))
+              base["hash"] = h
+              entries.append(base)
+              prev = h
+
+          with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+              for e in entries:
+                  f.write(canon(e).decode("utf-8") + "\n")
+              path = f.name
+
+          r = subprocess.run(["python", "tools/verify.py", path], capture_output=True, text=True)
+          print(r.stdout, r.stderr)
+          assert r.returncode == 0, r.stderr
+          print("verify.py OK")
+          PY
