@@ -220,10 +220,16 @@ step_obtain_cert() {
     log "certbot cert for $DOMAIN already present — skipping issuance"
     return
   fi
-  log "obtaining TLS cert for $DOMAIN and $WWW_DOMAIN via certbot --webroot"
+  # NOTE: $WWW_DOMAIN is intentionally NOT included by default — DNS may not
+  # have an A record for www. Set INCLUDE_WWW=1 to include it.
+  local -a www_args=()
+  if [[ "${INCLUDE_WWW:-0}" == "1" ]]; then
+    www_args+=("-d" "$WWW_DOMAIN")
+  fi
+  log "obtaining TLS cert for $DOMAIN${INCLUDE_WWW:+ + $WWW_DOMAIN} via certbot --webroot"
   certbot certonly \
     --webroot -w "$ACME_WEBROOT" \
-    -d "$DOMAIN" -d "$WWW_DOMAIN" \
+    -d "$DOMAIN" "${www_args[@]}" \
     --non-interactive --agree-tos \
     --email "${CERTBOT_EMAIL:-da03@yuntiandeng.com}" \
     --no-eff-email
