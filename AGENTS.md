@@ -187,22 +187,30 @@ The dataset includes `verify.py` so it's self-verifying.
 ## 7. Verify a chain (and every body) in one command
 
 ```bash
-# Most common: end-to-end verification of one live page.
-# Fetches the chain, fetches every body+salt, verifies every entry's hash,
-# every prev_hash link, and SHA-256(salt || body) == body_commitment for
-# each non-erased entry.
-python tools/verify.py https://append.page/p/advisors
+# Two lines. The verifier is served from the site itself, so both URLs
+# share a domain — easy to remember, easy to type from a tweet.
+curl -O https://append.page/verify.py
+python verify.py https://append.page/p/advisors
+```
 
+That fetches the chain, fetches every body+salt, and verifies every
+entry's `hash`, every `prev_hash` link, and `SHA-256(salt || body) ==
+body_commitment` for each non-erased entry. Exit code `0` = everything
+intact; `1` = something is broken (details on stderr).
+
+Other modes:
+
+```bash
 # Offline / from the HuggingFace mirror — chain only:
-python tools/verify.py path/to/page.jsonl
+python verify.py path/to/page.jsonl
 
 # Chain only from the live API (legacy form, no body check):
-curl -sS https://append.page/p/advisors/raw | python tools/verify.py /dev/stdin
+curl -sS https://append.page/p/advisors/raw | python verify.py /dev/stdin
 
 # Body check from a private archive: assemble bodies.json yourself as
 # {entry_id: {body, salt}} (salt is hex; available from /p/<slug>/bodies
 # even for entries that have since been erased) and pass:
-python tools/verify.py path/to/page.jsonl --with-bodies path/to/bodies.json
+python verify.py path/to/page.jsonl --with-bodies path/to/bodies.json
 ```
 
 Exit code `0` = everything intact. Exit code `1` = something is broken (details on stderr).
