@@ -24,7 +24,11 @@ import { NextResponse, type NextRequest } from "next/server";
 import { pool } from "@/lib/db";
 import { redis } from "@/lib/redis";
 import { BudgetExceededError } from "@/lib/llm";
-import { extractTagsBatch, TAG_PROMPT_VERSION } from "@/lib/tags";
+import {
+  extractTagsBatch,
+  TAG_PROMPT_VERSION,
+  type PerEntryMetadata,
+} from "@/lib/tags";
 
 export const dynamic = "force-dynamic";
 
@@ -37,8 +41,16 @@ const MAX_BODY_BYTES_PER_BATCH = 60_000;
 interface CandidateRow {
   id: string;
   body: string | null;
-  // tags from entry_tags (left join), null if uncached
+  subject: string | null;
   tags: string[] | null;
+  relevant: boolean | null; // null if uncached (left join)
+  relevance_reason: string | null;
+}
+
+interface PageRow {
+  slug: string;
+  head_seq: number;
+  description: string;
 }
 
 export async function GET(
@@ -49,30 +61,21 @@ export async function GET(
   const { searchParams } = new URL(req.url);
   const staleOk = searchParams.get("stale_ok") === "1";
 
-  const pageRow = await pool.query<{ slug: string; head_seq: number }>(
-    "SELECT slug, head_seq FROM pages WHERE slug = $1",
+  const pageRow = await pool.query<PageRow>(
+    "SELECT slug, head_seq, description FROM pages WHERE slug = $1",
     [slug],
   );
   if (pageRow.rows.length === 0) {
     return NextResponse.json({ error: "page_not_found" }, { status: 404 });
   }
-  if (pageRow.rows[0]!.head_seq < 0) {
-    return NextResponse.json(
-      {
-        entries_tags: {},
-        tag_counts: {},
-        uncached_count: 0,
-        stale: false,
-      },
-      { status: 200 },
-    );
+  const page = pageRow.rows[0]!;
+  if (page.head_seq < 0) {
+    return NextResponse.json(emptyResponse(), { status: 200 });
   }
 
-  // 1. Fetch all entries on the page + their tags (left-join).
-  //    Skip kind=moderation entries — moderation actions aren't user content
-  //    and don't need tagging.
   const candidatesQ = await pool.query<CandidateRow>(
-    `SELECT e.id, b.body, t.tags
+    `SELECT e.id, b.body,
+            t.subject, t.tags, t.relevant, t.relevance_reason
        FROM entries e
        LEFT JOIN entry_bodies b ON b.entry_id = e.id
        LEFT JOIN entry_tags   t ON t.entry_id = e.id
@@ -82,25 +85,29 @@ export async function GET(
   );
   const all = candidatesQ.rows;
 
-  const cachedTags = new Map<string, string[]>();
+  const cachedMeta = new Map<string, PerEntryMetadata>();
   const uncached: Array<{ id: string; body: string }> = [];
   for (const r of all) {
-    if (r.tags && Array.isArray(r.tags)) {
-      cachedTags.set(r.id, r.tags);
+    if (r.relevant !== null) {
+      // Has a row in entry_tags
+      cachedMeta.set(r.id, {
+        subject: r.subject,
+        tags: Array.isArray(r.tags) ? r.tags : [],
+        relevant: r.relevant,
+        relevance_reason: r.relevance_reason,
+      });
     } else if (r.body) {
       uncached.push({ id: r.id, body: r.body });
     }
   }
 
-  // 2. If anything is uncached, either extract inline or kick off bg work.
   if (uncached.length > 0) {
     if (staleOk) {
-      backgroundExtract(slug, uncached);
+      backgroundExtract(slug, page.description, uncached);
     } else {
-      // Inline extraction (called from the manual "regenerate" path).
       try {
-        const newTags = await extractWithCache(slug, uncached);
-        for (const [id, tags] of newTags) cachedTags.set(id, tags);
+        const newMeta = await extractWithCache(slug, page.description, uncached);
+        for (const [id, m] of newMeta) cachedMeta.set(id, m);
       } catch (err) {
         if (err instanceof BudgetExceededError) {
           return NextResponse.json(
@@ -112,30 +119,39 @@ export async function GET(
           );
         }
         console.error(`[tags ${slug}] inline extract failed:`, err);
-        // Fall through and serve whatever we've got cached.
       }
     }
   }
 
-  // 3. Build the response: per-entry tags + page-wide counts.
-  const entries_tags: Record<string, string[]> = {};
+  // Build the response: per-entry metadata + page-wide rollups.
+  const entries_meta: Record<string, PerEntryMetadata> = {};
   const tag_counts: Record<string, number> = {};
-  for (const [id, tags] of cachedTags) {
-    entries_tags[id] = tags;
-    for (const t of tags) {
-      tag_counts[t] = (tag_counts[t] ?? 0) + 1;
+  const subject_counts: Record<string, number> = {};
+  let irrelevant_count = 0;
+  for (const [id, m] of cachedMeta) {
+    entries_meta[id] = m;
+    if (m.relevant) {
+      if (m.subject) {
+        subject_counts[m.subject] = (subject_counts[m.subject] ?? 0) + 1;
+      }
+      for (const t of m.tags) {
+        tag_counts[t] = (tag_counts[t] ?? 0) + 1;
+      }
+    } else {
+      irrelevant_count++;
     }
   }
 
-  // Recompute uncached count after possible inline extraction.
   const uncachedAfter = all.filter(
-    (r) => !cachedTags.has(r.id) && r.body !== null,
+    (r) => !cachedMeta.has(r.id) && r.body !== null,
   ).length;
 
   return NextResponse.json(
     {
-      entries_tags,
+      entries_meta,
+      subject_counts,
       tag_counts,
+      irrelevant_count,
       uncached_count: uncachedAfter,
       stale: uncachedAfter > 0,
     },
@@ -147,36 +163,48 @@ export async function GET(
   );
 }
 
-/**
- * Persist a batch of (entry_id -> tags) into entry_tags.
- * Uses ON CONFLICT DO NOTHING so duplicate background extracts are idempotent.
- */
-async function persistTags(
-  tags: Map<string, string[]>,
+function emptyResponse() {
+  return {
+    entries_meta: {} as Record<string, never>,
+    subject_counts: {} as Record<string, number>,
+    tag_counts: {} as Record<string, number>,
+    irrelevant_count: 0,
+    uncached_count: 0,
+    stale: false,
+  };
+}
+
+/** Persist a batch of (entry_id -> meta) rows into entry_tags. Idempotent. */
+async function persistMeta(
+  meta: Map<string, PerEntryMetadata>,
   costPerEntry: number,
 ): Promise<void> {
-  if (tags.size === 0) return;
-  // Bulk insert via VALUES — one round-trip.
+  if (meta.size === 0) return;
   const values: unknown[] = [];
   const tuples: string[] = [];
   let i = 1;
-  for (const [id, tagList] of tags) {
+  for (const [id, m] of meta) {
     tuples.push(
-      `($${i}, $${i + 1}::jsonb, $${i + 2}, $${i + 3}, $${i + 4})`,
+      `($${i}, $${i + 1}, $${i + 2}::jsonb, $${i + 3}, $${i + 4}, $${i + 5}, $${i + 6}, $${i + 7})`,
     );
     values.push(
       id,
-      JSON.stringify(tagList),
+      m.subject,
+      JSON.stringify(m.tags),
+      m.relevant,
+      m.relevance_reason,
       TAGS_MODEL,
       TAG_PROMPT_VERSION,
       costPerEntry.toFixed(6),
     );
-    i += 5;
+    i += 8;
   }
   await pool.query(
-    `INSERT INTO entry_tags (entry_id, tags, model, prompt_version, cost_usd)
-       VALUES ${tuples.join(", ")}
-       ON CONFLICT (entry_id) DO NOTHING`,
+    `INSERT INTO entry_tags
+       (entry_id, subject, tags, relevant, relevance_reason,
+        model, prompt_version, cost_usd)
+     VALUES ${tuples.join(", ")}
+     ON CONFLICT (entry_id) DO NOTHING`,
     values,
   );
 }
@@ -184,18 +212,22 @@ async function persistTags(
 /** Extract + persist in one shot. Used for both inline and background paths. */
 async function extractWithCache(
   slug: string,
+  description: string,
   uncached: Array<{ id: string; body: string }>,
-): Promise<Map<string, string[]>> {
-  const merged = new Map<string, string[]>();
-  // Process in batches to keep prompt size bounded.
-  for (const batch of chunkByBytes(uncached, MAX_BATCH_SIZE, MAX_BODY_BYTES_PER_BATCH)) {
-    const result = await extractTagsBatch(batch);
+): Promise<Map<string, PerEntryMetadata>> {
+  const merged = new Map<string, PerEntryMetadata>();
+  for (const batch of chunkByBytes(
+    uncached,
+    MAX_BATCH_SIZE,
+    MAX_BODY_BYTES_PER_BATCH,
+  )) {
+    const result = await extractTagsBatch(batch, { slug, description });
     const perEntry =
       batch.length > 0 ? result.costUsd / batch.length : 0;
-    await persistTags(result.tags, perEntry);
-    for (const [id, tags] of result.tags) merged.set(id, tags);
+    await persistMeta(result.meta, perEntry);
+    for (const [id, m] of result.meta) merged.set(id, m);
     console.log(
-      `[tags ${slug}] extracted ${result.tags.size}/${batch.length} entries, $${result.costUsd.toFixed(4)}, ${result.generationSeconds.toFixed(1)}s`,
+      `[tags ${slug}] extracted ${result.meta.size}/${batch.length} entries, $${result.costUsd.toFixed(4)}, ${result.generationSeconds.toFixed(1)}s`,
     );
   }
   return merged;
@@ -236,6 +268,7 @@ function chunkByBytes<T extends { body: string }>(
  */
 function backgroundExtract(
   slug: string,
+  description: string,
   uncached: Array<{ id: string; body: string }>,
 ): void {
   void (async () => {
@@ -243,7 +276,7 @@ function backgroundExtract(
     try {
       const got = await redis.set(lockKey, "1", "EX", 120, "NX");
       if (got !== "OK") return; // another worker is on it
-      await extractWithCache(slug, uncached);
+      await extractWithCache(slug, description, uncached);
     } catch (err) {
       if (err instanceof BudgetExceededError) {
         console.warn(`[tags ${slug}] bg extract skipped: budget cap`);
