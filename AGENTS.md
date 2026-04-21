@@ -227,7 +227,90 @@ The verifier is one stdlib-only Python file (`urllib`, `hashlib`, `json` + the `
 
 ---
 
-## 8. Fork the frontend with your coding agent
+## 8. Build your own viewer (no fork required)
+
+The simplest way to add a new view of append.page is **not** to fork the
+frontend at all — it's to write a small static page somewhere else that
+fetches our public read endpoints and renders them however you like.
+All read endpoints are CORS-open (`Access-Control-Allow-Origin: *`),
+so an HTML+JS file you serve from `your-domain.com`, GitHub Pages,
+Netlify, an `<iframe>` on your blog, or even a `file://` open in a
+browser tab will work.
+
+The whole minimum viewer is roughly this:
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<title>my own viewer for /p/advisors</title>
+<script type="module">
+  const slug = "advisors";
+  const base = "https://append.page";
+
+  // 1. Get the chain.
+  const raw = await fetch(`${base}/p/${slug}/raw`).then((r) => r.text());
+  const chain = raw.trim().split("\n").map((l) => JSON.parse(l));
+
+  // 2. Get the bodies + salts in one batch.
+  const bodyResp = await fetch(`${base}/p/${slug}/bodies`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: chain.map((e) => e.id) }),
+  }).then((r) => r.json());
+  const bodyById = Object.fromEntries(
+    bodyResp.entries.map((e) => [e.entry.id, e]),
+  );
+
+  // 3. Render however you want. (Optionally also fetch
+  //    `${base}/p/${slug}/views/doc` to get the AI-synthesized doc as JSON.)
+  document.body.innerHTML = chain
+    .map((e) => {
+      const b = bodyById[e.id];
+      const text = b.erased ? "[erased]" : b.body;
+      return `<article><h3>#${e.seq}</h3><pre>${text}</pre></article>`;
+    })
+    .join("");
+</script>
+```
+
+That's a complete, working alternative viewer. It will continue to
+work as long as the wire format in §2 is stable — no SDK to update,
+no auth to manage, no rate limits to negotiate (read endpoints are
+unmetered).
+
+**What's CORS-open vs CORS-closed:**
+
+| Endpoint                           | CORS  | Why |
+|-----------------------------------|-------|-----|
+| `GET /p/<slug>/raw`               | open  | the canonical chain |
+| `POST /p/<slug>/bodies`           | open  | bulk body fetch (no side effects) |
+| `GET /p/<slug>/e/<id>`            | open  | single body fetch |
+| `GET /p/<slug>/views/doc`         | open  | AI-synthesized doc as JSON |
+| `GET /p/<slug>/views/default`     | open  | legacy AI groupings as JSON |
+| `GET /p/<slug>/tags`              | open  | per-entry tag metadata |
+| `GET /pages`                      | open  | page list / search |
+| `GET /api/spec.json`              | open  | machine-readable spec |
+| `GET /verify.py`                  | open  | the standalone verifier |
+| `POST /p/<slug>/entries`          | **closed** | posting must come from append.page or a CLI |
+| `POST /pages`                     | **closed** | page creation must come from append.page or a CLI |
+| `POST /p/<slug>/views`            | **closed** | custom-view generation (planned, BYOK) |
+
+The reason write endpoints are CORS-closed: per-IP rate limits are how
+we control posting abuse. A third-party in-browser frontend that
+proxied user posts to us would either have to burn its own IP budget
+for every user, or force us to trust an arbitrary `X-Forwarded-For` —
+neither is acceptable. Posts come straight to append.page (or via
+`curl`, which doesn't speak CORS and just gets the standard per-IP
+rate limit treatment from the actual client IP). **Reading is
+decentralizable; writing is centralized to keep the data clean.**
+
+If you want to ship something more polished than a 30-line script and
+share it back, the next section walks you through forking the official
+frontend.
+
+---
+
+## 9. Fork the frontend with your coding agent
 
 Most "fork it" instructions assume a human reader. This one is written assuming you might be an agent (Cursor, Claude, etc.) reading this file at <https://append.page/AGENTS.md>.
 
@@ -262,7 +345,7 @@ Everything else is yours: layout, colors, typography, what the AI view looks lik
 
 ---
 
-## 9. Build your own backend
+## 10. Build your own backend
 
 The wire format is small enough that you can build a fully spec-compliant backend in a weekend. Implement:
 
@@ -276,7 +359,7 @@ The reference implementation in this repo at `appendpage/server/` is ~2000 lines
 
 ---
 
-## 10. Operator and legal
+## 11. Operator and legal
 
 - **Operator:** [@da03](https://github.com/da03) (Yuntian Deng).
 - **Contact:** see [`docs/legal/contact.md`](./docs/legal/contact.md) — single email for erasure, takedown, abuse, general questions.
@@ -285,7 +368,7 @@ The reference implementation in this repo at `appendpage/server/` is ~2000 lines
 
 ---
 
-## 11. Status of this document
+## 12. Status of this document
 
 This is the v0 spec. v1 will likely add:
 
