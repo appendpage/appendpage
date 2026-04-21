@@ -1,7 +1,7 @@
 # Multi-stage build for the Next.js backend (server/ in the monorepo).
 # Uses Next.js's standalone output to keep the runtime image small.
 
-ARG NODE_VERSION=20-alpine
+ARG NODE_VERSION=20-bookworm-slim
 
 # ---------- deps ----------
 FROM node:${NODE_VERSION} AS deps
@@ -33,7 +33,8 @@ FROM node:${NODE_VERSION} AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN addgroup -S appendpage && adduser -S appendpage -G appendpage
+# Debian/bookworm-slim version of the addgroup/adduser commands.
+RUN groupadd -r appendpage && useradd -r -g appendpage -s /usr/sbin/nologin appendpage
 
 # Copy the standalone build output. server/ becomes the runtime cwd so
 # `process.cwd()/../AGENTS.md` resolves to the repo-root copy we placed at /AGENTS.md.
