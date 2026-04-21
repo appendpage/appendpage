@@ -55,7 +55,7 @@ Then `curl -X POST http://localhost:3000/p/test/entries -H 'content-type: applic
 │   ├── 01-spec.md       wire format spec (canonical: AGENTS.md)
 │   ├── 02-api.md        API spec (canonical: /api/spec.json)
 │   ├── 03-deployment.md deployment guide for the shared host
-│   ├── 04-security.md   threat model, salt rotation, BYOK handling
+│   ├── 04-security.md   threat model, abuse-prevention design notes
 │   ├── 05-moderation.md moderation policy
 │   └── legal/           privacy, terms, contact pages (served on the site)
 ├── infra/

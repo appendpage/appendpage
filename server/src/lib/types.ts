@@ -43,8 +43,6 @@ export type ChainEntry = z.infer<typeof ChainEntrySchema>;
 export const PostEntryRequestSchema = z.object({
   body: z.string().min(1).max(4096),
   parent_id: z.string().regex(ULID_REGEX).optional(),
-  // turnstile_token is required in prod (Phase B), optional in dev / Phase A.
-  turnstile_token: z.string().optional(),
 });
 export type PostEntryRequest = z.infer<typeof PostEntryRequestSchema>;
 
@@ -53,7 +51,6 @@ export const CreatePageRequestSchema = z.object({
   slug: z.string().regex(SLUG_REGEX),
   description: z.string().max(280).optional(),
   default_view_prompt: z.string().max(2000).optional(),
-  turnstile_token: z.string().optional(),
 });
 export type CreatePageRequest = z.infer<typeof CreatePageRequestSchema>;
 

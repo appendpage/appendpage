@@ -75,7 +75,8 @@ const SPEC = {
     {
       method: "POST",
       path: "/p/{slug}/entries",
-      summary: "Append an entry to a page's chain.",
+      summary:
+        "Append an entry to a page's chain. Rate-limited per IP; see /AGENTS.md §6.",
       request: {
         type: "object",
         additionalProperties: false,
@@ -83,7 +84,6 @@ const SPEC = {
         properties: {
           body: { type: "string", minLength: 1, maxLength: 4096 },
           parent_id: { $ref: "#/definitions/UlidId" },
-          turnstile_token: { type: "string" },
         },
       },
       response_201: {
@@ -98,15 +98,13 @@ const SPEC = {
     {
       method: "POST",
       path: "/pages",
-      summary: "Create a new page.",
+      summary: "Create a new page. Rate-limited per IP.",
       request: {
         type: "object",
         required: ["slug"],
         properties: {
           slug: { $ref: "#/definitions/Slug" },
           description: { type: "string", maxLength: 280 },
-          default_view_prompt: { type: "string", maxLength: 2000 },
-          turnstile_token: { type: "string" },
         },
       },
       response_201: {

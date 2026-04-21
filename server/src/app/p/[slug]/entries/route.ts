@@ -1,8 +1,10 @@
 /**
  * POST /p/:slug/entries — append an entry to a page's chain.
  *
- * Phase A walking skeleton: no Turnstile, no rate-limit, no provenance hashing.
- * Provenance fields are set to placeholder values; Phase B wires them up.
+ * Provenance: ip_hash (fixed internal salt + normalized IP) and
+ * user_agent_hash are written to entry_provenance for rate-limiting and
+ * abuse triage. Per-IP rate limit is enforced via the lib/rate-limit.ts
+ * Redis counter before any DB work happens.
  */
 import { createHash } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
@@ -10,6 +12,8 @@ import { NextResponse, type NextRequest } from "next/server";
 import { appendEntry } from "@/lib/chain";
 import { checkAll, clientIpFromHeaders } from "@/lib/rate-limit";
 import { ChainError, PostEntryRequestSchema } from "@/lib/types";
+
+const IP_HASH_SALT = process.env.APPENDPAGE_IP_HASH_SALT ?? "appendpage-v0";
 
 export const dynamic = "force-dynamic";
 
@@ -56,9 +60,10 @@ export async function POST(
     "0.0.0.0";
   const ua = req.headers.get("user-agent") ?? "";
 
-  // Phase A placeholder provenance — Phase B replaces with proper salted hashes.
+  // Fixed-salt IP and user-agent hashes for abuse triage. We do not store
+  // the raw IP or UA anywhere; only the hashes land in entry_provenance.
   const ipHash =
-    "sha256:" + createHash("sha256").update(`devsalt:${ip}`).digest("hex");
+    "sha256:" + createHash("sha256").update(`${IP_HASH_SALT}:${ip}`).digest("hex");
   const userAgentHash =
     "sha256:" + createHash("sha256").update(ua).digest("hex");
 
@@ -70,8 +75,8 @@ export async function POST(
       kind: "entry",
       expectedPrevHash,
       ipHash,
-      ipSaltId: 0, // Phase B: real salt id from Redis
-      captchaId: parsed.data.turnstile_token ?? "phase-a-no-captcha",
+      ipSaltId: 0,
+      captchaId: "none",
       userAgentHash,
     });
     return NextResponse.json({ entry }, { status: 201 });

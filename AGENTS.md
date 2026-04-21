@@ -40,7 +40,7 @@ Every entry in every page's chain is a JSON object with exactly these fields:
 | `id` | string (ULID, 26 chars, time-ordered, URL-safe) | Stable identifier for this entry. Used in `parent` references and in URLs like `/p/<page>/e/<id>`. |
 | `page` | string (slug) | The page this entry belongs to. Self-describing: an entry detached from its page can still tell you where it came from. |
 | `seq` | non-negative integer | Per-page monotonic sequence (0, 1, 2, ...). Useful for pagination. Redundant with chain position but cheap. |
-| `kind` | `"entry"` or `"moderation"` | `entry` = anyone-posted content. `moderation` = admin-posted action targeting another entry via `parent`. Posters can only post `entry`; only the admin queue can issue `moderation`. |
+| `kind` | `"entry"` or `"moderation"` | `entry` = anyone-posted content. `moderation` = operator-issued action (e.g. an erasure record) targeting another entry via `parent`. Posters can only post `entry`. |
 | `parent` | string (id of another entry on the same page), or `null` | If `kind=entry` and `parent != null` → reply to that entry. If `kind=moderation` → the entry being moderated. If `null` → top-level post. |
 | `body_commitment` | `"sha256:" + hex(SHA-256(salt ‖ body_utf8_bytes))` | Cryptographic commitment to the body. The body and salt live off-chain in a private table. See §4 for why. |
 | `created_at` | ISO 8601 UTC timestamp | Server-stamped at append time. Not poster-supplied. |
@@ -129,7 +129,7 @@ Honest framing of what the chain guarantees, in increasing order of strength:
 1. **Body matches commitment** — guaranteed without any external observer. Anyone who fetches `(body, salt)` and computes `H(salt ‖ body)` can check it matches the on-chain `body_commitment`. If the operator silently changes a body, this fails immediately.
 2. **Chain is internally consistent** — guaranteed without any external observer. Anyone with the current JSONL can verify all `hash` values and all `prev_hash` links. Editing/deleting/reordering one entry breaks the chain.
 3. **No retroactive editing/deletion since some past observation** — requires that **at least one party** has saved a snapshot of the chain (or just the head hash) at any past moment. They can re-fetch and diff. This is the "weak assumption" that delivers the headline product promise. The HuggingFace dataset (Git-versioned, hourly push) makes this trivial — anyone who clones the dataset at any past point has a snapshot the operator cannot reach.
-4. **Chain wasn't fabricated from genesis before anyone first looked** — **NOT guaranteed in v0.** This is what OpenTimestamps-via-Bitcoin would close (planned for v1). For now, the more downloads and clones exist in the wild, the smaller the undetected-rewrite window.
+4. **Chain wasn't fabricated from genesis before anyone first looked** — **NOT guaranteed.** Closing this would require a global tamper-proof timestamp on the genesis hash (e.g. anchoring to a public blockchain), which we don't do. For now, the more downloads and clones exist in the wild, the smaller the undetected-rewrite window.
 
 We deliberately do not claim things the math doesn't support. See <https://append.page/about> for the honest framing.
 
@@ -153,21 +153,18 @@ Base URL: `https://append.page` (or your own backend if you've deployed a fork).
 | `GET` | `/api/spec.json` | `application/json` — full machine-readable spec (entry schema + endpoints). |
 | `GET` | `/status` | `application/json` — `{uptime, last_anchor_at, free_disk_bytes, llm_budget_remaining_today_usd}`. |
 
-### Write (Turnstile + rate-limited)
+### Write (rate-limited per IP)
 
 | method | path | body | returns |
 |---|---|---|---|
-| `POST` | `/p/:slug/entries` | `{body: string, parent_id?: string, turnstile_token: string}` | `{entry}` — the canonical entry that just got committed (with `id`, `hash`, `prev_hash`, `seq`). |
+| `POST` | `/p/:slug/entries` | `{body: string, parent_id?: string}` | `{entry}` — the canonical entry that just got committed (with `id`, `hash`, `prev_hash`, `seq`). |
 | `POST` | `/p/:slug/bodies` | `{ids: string[]}` (max 200) | `{entries: [{entry, body, salt, erased, erased_reason?}]}` — bulk-fetch bodies. `salt` is 64-char hex and is returned for every entry (erased or not), so anyone with a private body archive can re-verify offline. Erased entries return `body: null`. |
 | `GET`  | `/p/:slug/e/:id` | — | Single-entry version of the above: `{entry, body, salt, erased, erased_reason?}`. |
-| `POST` | `/p/:slug/entries/:id/flag` | `{turnstile_token: string}` | `{ok: true}`. |
-| `POST` | `/pages` | `{slug: string, description?: string, turnstile_token: string}` | `{slug, status: "live"|"queued"}` — `queued` if the slug matches the name-shaped review pattern. |
-| `POST` | `/p/:slug/views` | `{prompt: string, byok_key?: string}` | `{view_json, cached, cost_usd, source}` — generate or fetch a Custom view for `(prompt, head_hash)`. If `byok_key` is supplied it's used to call OpenAI directly (held in request-scoped memory only, never logged or persisted). |
+| `POST` | `/pages` | `{slug: string, description?: string}` | `{slug, status: "live"\|"queued_review"}` — `queued_review` if the slug matches the name-shaped review pattern. |
 
 ### Conventions
 
-- All write endpoints require a Turnstile token (`turnstile_token` field).
-- Rate limits returned as `429 Too Many Requests` with `Retry-After` header.
+- Rate limits are per-IP, configured in the `rate_limit_config` table and tunable at runtime. Current defaults: 30 entries/min/IP, 300 entries/hr/IP, 10 pages/hr/IP, 40 pages/day/IP. Returned as `429 Too Many Requests` with a `Retry-After` header.
 - Optional optimistic concurrency on `POST /p/:slug/entries`: send `Expect-Prev-Hash: <hash>`; if it doesn't match the current head, returns `409 Conflict` with `{actual_head_hash}`.
 
 ### Bulk download
@@ -312,7 +309,6 @@ Endpoints in the open-CORS set:
 | `GET /verify.py`                  | the standalone verifier |
 | `POST /p/<slug>/entries`          | append a post (rate-limited per IP) |
 | `POST /pages`                     | create a new page (rate-limited per IP) |
-| `POST /p/<slug>/views`            | custom-view generation (planned, BYOK) |
 
 Read is decentralizable, posting is decentralizable too (one person at
 a time), service-scale aggregation is gated by the rate limiter, not by
@@ -353,7 +349,7 @@ You now have a fully working alternative viewer for append.page on `localhost:30
 - **Honest framing of tamper-evidence** — see §5. Don't claim more than the math supports.
 - **The compose box with a single body textarea** — posters write freeform markdown. Don't force structured fields on them.
 
-Everything else is yours: layout, colors, typography, what the AI view looks like, what custom-view prompts you suggest, how you render moderation entries, etc.
+Everything else is yours: layout, colors, typography, what the AI doc view looks like, how you render moderation entries, etc.
 
 **Step 4.** Deploy yours wherever. If you'd like it featured on `append.page` as an alternative visualizer, open an issue at <https://github.com/appendpage/appendpage/issues>.
 
@@ -375,8 +371,8 @@ The reference implementation in this repo at `appendpage/server/` is ~2000 lines
 
 ## 11. Operator and legal
 
-- **Operator:** [@da03](https://github.com/da03) (Yuntian Deng).
-- **Contact:** see [`docs/legal/contact.md`](./docs/legal/contact.md) — single email for erasure, takedown, abuse, general questions.
+- **Operator:** [@da03](https://github.com/da03) (Yuntian Deng), University of Waterloo.
+- **Contact:** GitHub issues at <https://github.com/appendpage/appendpage/issues> are the channel for everything — general questions, erasure requests, takedowns, abuse reports. Security disclosures go via [GitHub Security Advisories](https://github.com/appendpage/appendpage/security/advisories/new). Full details in [`docs/legal/contact.md`](./docs/legal/contact.md).
 - **Privacy notice:** [`docs/legal/privacy.md`](./docs/legal/privacy.md).
 - **Terms of use:** [`docs/legal/terms.md`](./docs/legal/terms.md).
 
@@ -384,14 +380,7 @@ The reference implementation in this repo at `appendpage/server/` is ~2000 lines
 
 ## 12. Status of this document
 
-This is the v0 spec. v1 will likely add:
-
-- OpenTimestamps Bitcoin anchoring for absolute (not snapshot-dependent) tamper-evidence.
-- Operator Ed25519 signatures on `kind=moderation` entries, so the chain proves *who* posted each moderation action.
-- On-chain `kind=flag` entries so community moderation is also tamper-evident.
-- Optional typed `references[]` annotations on entries (`annotates / corrects / endorses / disputes`) bound to the target's hash.
-
-Spec changes will be minor-version bumps with backwards-compatible additions whenever possible. Watch the GitHub repo for releases.
+This document describes the wire format and HTTP API as currently deployed at <https://append.page>. Any change to the deployed shape is a change to this document; any field or endpoint described here is one you can call against the live server today. Track changes via the GitHub repo's commit history.
 
 ---
 
