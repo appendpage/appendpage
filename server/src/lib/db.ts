@@ -17,23 +17,43 @@ function makePool(): Pool {
   if (!url) {
     throw new Error("DATABASE_URL is not set");
   }
-  const pool = new Pool({
+  const p = new Pool({
     connectionString: url,
     // Conservative defaults; tune in Phase D under load.
     max: 10,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
   });
-  pool.on("error", (err) => {
+  p.on("error", (err) => {
     // Do not crash the server on idle-client errors; just log.
     console.error("[pg] idle client error:", err.message);
   });
-  return pool;
+  return p;
 }
 
-export const pool: Pool =
-  globalThis.__appendpage_pg_pool ??
-  (globalThis.__appendpage_pg_pool = makePool());
+/**
+ * Lazy pool getter — Pool is constructed on first call, not at module load.
+ * This matters during `next build` (page-data collection) where the build
+ * process imports route modules but doesn't have DATABASE_URL set.
+ *
+ * The `pool` named export is a Proxy that defers to the underlying singleton
+ * on every property access, preserving the existing call sites that do
+ * `pool.connect()`, `pool.query(...)`, etc.
+ */
+function getPool(): Pool {
+  if (!globalThis.__appendpage_pg_pool) {
+    globalThis.__appendpage_pg_pool = makePool();
+  }
+  return globalThis.__appendpage_pg_pool;
+}
+
+export const pool: Pool = new Proxy({} as Pool, {
+  get(_target, prop, receiver) {
+    const real = getPool();
+    const value = Reflect.get(real, prop, real);
+    return typeof value === "function" ? value.bind(real) : value;
+  },
+});
 
 /**
  * Run `fn` inside a single transaction with a single dedicated client.
