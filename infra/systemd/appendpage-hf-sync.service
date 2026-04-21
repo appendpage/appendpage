@@ -1,0 +1,27 @@
+[Unit]
+Description=Sync append.page ledger to huggingface.co/datasets/appendpage/ledger
+Documentation=https://github.com/appendpage/appendpage
+Requires=appendpage.service
+After=appendpage.service
+
+[Service]
+Type=oneshot
+User=appendpage
+Group=appendpage
+# Sourced for HF_TOKEN, HF_DATASET_REPO, etc.
+EnvironmentFile=/etc/appendpage/.env
+ExecStart=/var/lib/appendpage/venv/bin/python /var/lib/appendpage/compose/infra/hf-sync.py
+# Hardening — no network to the world needed beyond the HF API and localhost.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/appendpage
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=appendpage-hf-sync

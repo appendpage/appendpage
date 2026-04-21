@@ -1,0 +1,15 @@
+[Unit]
+Description=Run appendpage HF sync every 10 min
+Documentation=https://github.com/appendpage/appendpage
+
+[Timer]
+# First run 2 min after boot so the app has time to come up.
+OnBootSec=2min
+# Every 10 min thereafter. HF soft-limit is 256 commits/hour; we're at
+# 6/hour worst-case, and only push if something actually changed.
+OnUnitActiveSec=10min
+Unit=appendpage-hf-sync.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
