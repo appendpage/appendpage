@@ -1,0 +1,50 @@
+[Unit]
+Description=append.page Next.js backend (bare Node, behind nginx)
+Documentation=https://github.com/appendpage/appendpage
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=appendpage
+Group=appendpage
+WorkingDirectory=/var/lib/appendpage/compose/server/.next/standalone
+
+# Source the production env file (POSTGRES_PASSWORD, OPENAI_API_KEY, etc.)
+EnvironmentFile=/etc/appendpage/.env
+
+# Bind to a non-conflicting internal port; nginx proxies 443 -> 38080.
+# 3000 and 3451 are taken by the existing tenants.
+Environment=NODE_ENV=production
+Environment=PORT=38080
+Environment=HOSTNAME=127.0.0.1
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=PAGES_DIR=/var/lib/appendpage/pages
+
+# nvm-installed Node 20 lives under appendpage's home; make it explicit so
+# systemd doesn't fall back to system node 12.
+ExecStart=/var/lib/appendpage/.nvm/versions/node/v20.20.2/bin/node server.js
+
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+# Light hardening (don't break the existing tenant pattern, just tighten ours).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/appendpage
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# Logs to journald; tail with: journalctl -u appendpage -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=appendpage
+
+[Install]
+WantedBy=multi-user.target
