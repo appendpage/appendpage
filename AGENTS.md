@@ -307,9 +307,8 @@ If you'd like your viewer featured as an alternative visualizer at append.page, 
 ## 10. Operator, legal, and document status
 
 - **Operator:** [@da03](https://github.com/da03) (Yuntian Deng), University of Waterloo. Personal research project, not a University of Waterloo service.
-- **Contact:** [GitHub issues](https://github.com/appendpage/appendpage/issues) for everything — questions, erasure requests, takedowns, abuse reports. Security disclosures via [GitHub Security Advisories](https://github.com/appendpage/appendpage/security/advisories/new). Full details in [`docs/legal/contact.md`](./docs/legal/contact.md).
-- **Privacy notice:** [`docs/legal/privacy.md`](./docs/legal/privacy.md) — short, honest, describes what the deployed code actually does.
-- **Terms of use:** [`docs/legal/terms.md`](./docs/legal/terms.md).
+- **Contact:** [GitHub issues](https://github.com/appendpage/appendpage/issues) for everything — questions, erasure requests, takedowns, abuse reports. Security disclosures via [GitHub Security Advisories](https://github.com/appendpage/appendpage/security/advisories/new).
+- **Plain-language notes** on data handling, posting rules, and disputes: <https://append.page/notes> (also reachable as `/privacy`, `/terms`, `/contact`).
 
 This document tracks the live deployment at <https://append.page>. Any field or endpoint described above is one you can call against the server today; track changes via the GitHub repo's commit history.
 

@@ -1,8 +1,10 @@
 /**
- * GET /contact — legacy alias for /notes (the single combined page).
+ * GET /notes — serve docs/legal/notes.md as text/markdown.
  *
- * Kept so old links and search-engine results don't 404. New canonical
- * URL is /notes.
+ * `notes.md` is the single combined plain-language page covering data
+ * handling, posting rules, contact, and disputes. The legacy URLs
+ * /privacy, /terms, and /contact all serve the same content so that
+ * existing links continue to work.
  */
 import { readRepoFile } from "@/lib/repo-files";
 
