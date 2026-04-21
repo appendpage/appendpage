@@ -158,6 +158,8 @@ Base URL: `https://append.page` (or your own backend if you've deployed a fork).
 | method | path | body | returns |
 |---|---|---|---|
 | `POST` | `/p/:slug/entries` | `{body: string, parent_id?: string, turnstile_token: string}` | `{entry}` — the canonical entry that just got committed (with `id`, `hash`, `prev_hash`, `seq`). |
+| `POST` | `/p/:slug/bodies` | `{ids: string[]}` (max 200) | `{entries: [{entry, body, salt, erased, erased_reason?}]}` — bulk-fetch bodies. `salt` is 64-char hex and is returned for every entry (erased or not), so anyone with a private body archive can re-verify offline. Erased entries return `body: null`. |
+| `GET`  | `/p/:slug/e/:id` | — | Single-entry version of the above: `{entry, body, salt, erased, erased_reason?}`. |
 | `POST` | `/p/:slug/entries/:id/flag` | `{turnstile_token: string}` | `{ok: true}`. |
 | `POST` | `/pages` | `{slug: string, description?: string, turnstile_token: string}` | `{slug, status: "live"|"queued"}` — `queued` if the slug matches the name-shaped review pattern. |
 | `POST` | `/p/:slug/views` | `{prompt: string, byok_key?: string}` | `{view_json, cached, cost_usd, source}` — generate or fetch a Custom view for `(prompt, head_hash)`. If `byok_key` is supplied it's used to call OpenAI directly (held in request-scoped memory only, never logged or persisted). |
@@ -182,22 +184,38 @@ The dataset includes `verify.py` so it's self-verifying.
 
 ---
 
-## 7. Verify a chain in one command
+## 7. Verify a chain (and every body) in one command
 
 ```bash
-# from a downloaded JSONL:
+# Most common: end-to-end verification of one live page.
+# Fetches the chain, fetches every body+salt, verifies every entry's hash,
+# every prev_hash link, and SHA-256(salt || body) == body_commitment for
+# each non-erased entry.
+python tools/verify.py https://append.page/p/advisors
+
+# Offline / from the HuggingFace mirror — chain only:
 python tools/verify.py path/to/page.jsonl
 
-# from the live API:
+# Chain only from the live API (legacy form, no body check):
 curl -sS https://append.page/p/advisors/raw | python tools/verify.py /dev/stdin
 
-# with body reveals (if you've saved bodies and want to confirm them against the commitments):
+# Body check from a private archive: assemble bodies.json yourself as
+# {entry_id: {body, salt}} (salt is hex; available from /p/<slug>/bodies
+# even for entries that have since been erased) and pass:
 python tools/verify.py path/to/page.jsonl --with-bodies path/to/bodies.json
 ```
 
-Exit code `0` = chain is intact. Exit code `1` = chain is broken (with a line number of the first failure on stderr).
+Exit code `0` = everything intact. Exit code `1` = something is broken (details on stderr).
 
-The verifier is ~50 lines of Python with no third-party dependencies (uses only `hashlib` and `json` from stdlib + `jcs` for canonicalization). It ships in this repo at `tools/verify.py` and is copied into every HuggingFace dataset push.
+What the URL form actually checks, per entry:
+1. `hash == SHA-256(JCS(entry_minus_hash))`
+2. `prev_hash == previous_entry.hash` (and the genesis seed if `--genesis-at` is given)
+3. `seq` increments by 1 from 0; `page` is constant across the chain
+4. For non-erased entries: `body_commitment == SHA-256(salt || body)`
+
+Erased entries skip step 4 (no body to check), but their chain-link is still verified.
+
+The verifier is one stdlib-only Python file (`urllib`, `hashlib`, `json` + the `jcs` PyPI package for RFC 8785 canonicalization, with a byte-equivalent fallback if `jcs` isn't installed). It ships in this repo at `tools/verify.py` and is copied into every HuggingFace dataset push.
 
 ---
 

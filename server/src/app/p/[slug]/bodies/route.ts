@@ -2,11 +2,21 @@
  * POST /p/:slug/bodies — bulk fetch bodies for many entries on one page.
  *
  * Body: { ids: string[] }   (max 200 ids per request)
- * Returns: { entries: Array<{ entry, body, erased, erased_reason? }> }
+ * Returns: { entries: Array<{ entry, body, salt?, erased, erased_reason? }> }
  *
- * Used by the frontend's chronological view to render bodies efficiently.
- * Erased bodies return body=null, erased=true (with the reason from the
- * matching kind=moderation entry, when available).
+ * Used by the frontend's chronological view to render bodies efficiently
+ * AND by the chain verifier (tools/verify.py) to confirm that
+ * H(salt || body) == entry.body_commitment for every non-erased entry.
+ *
+ * Salt exposure: returned as 64-char lowercase hex for every entry,
+ * including erased ones. Returning salt for erased entries lets anyone
+ * who archived the body before erasure still prove that the body they
+ * have is the body the chain committed to — they recompute
+ * SHA-256(salt || archived_body) themselves. The trade-off is that the
+ * salt no longer hides erased bodies from a dictionary attack (an
+ * attacker who can guess the original body can confirm their guess).
+ * For the kind of content this platform expects, the verifiability
+ * win is worth the privacy cost.
  */
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
@@ -23,6 +33,7 @@ const BodyRequest = z.object({
 interface Row {
   id: string;
   body: string | null;
+  salt: Buffer | null;
   erased_at: Date | null;
   erased_reason: string | null;
   // From entries:
@@ -54,7 +65,7 @@ export async function POST(
     `SELECT
        e.id, e.page_slug, e.seq, e.kind, e.parent_id,
        e.body_commitment, e.created_at, e.prev_hash, e.hash,
-       b.body, b.erased_at, b.erased_reason
+       b.body, b.salt, b.erased_at, b.erased_reason
      FROM entries e
      LEFT JOIN entry_bodies b ON b.entry_id = e.id
      WHERE e.page_slug = $1 AND e.id = ANY($2::text[])`,
@@ -76,6 +87,7 @@ export async function POST(
         hash: row.hash,
       },
       body: erased ? null : row.body,
+      salt: row.salt ? row.salt.toString("hex") : null,
       erased,
       ...(erased && row.erased_reason
         ? { erased_reason: row.erased_reason }

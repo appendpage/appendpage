@@ -2,8 +2,14 @@
  * GET /p/:slug/e/:id — fetch a single entry with its body.
  *
  * Used by individual-entry permalinks and as a fallback when the bulk
- * /p/:slug/bodies endpoint is unavailable. Erased bodies return
- * { entry, body: null, erased: true, erased_reason? }.
+ * /p/:slug/bodies endpoint is unavailable. The shape mirrors /bodies:
+ *   - non-erased: { entry, body, salt, erased: false }
+ *   - erased:     { entry, body: null, erased: true, erased_reason? }
+ *
+ * Salt is exposed (as 64-char hex) for every entry, including erased
+ * ones. This lets anyone who archived a body before erasure prove their
+ * archived copy is the one the chain committed to. See /bodies route
+ * header for the full rationale.
  */
 import { NextResponse } from "next/server";
 
@@ -27,13 +33,14 @@ export async function GET(
     prev_hash: string;
     hash: string;
     body: string | null;
+    salt: Buffer | null;
     erased_at: Date | null;
     erased_reason: string | null;
   }>(
     `SELECT
        e.id, e.page_slug, e.seq, e.kind, e.parent_id,
        e.body_commitment, e.created_at, e.prev_hash, e.hash,
-       b.body, b.erased_at, b.erased_reason
+       b.body, b.salt, b.erased_at, b.erased_reason
      FROM entries e
      LEFT JOIN entry_bodies b ON b.entry_id = e.id
      WHERE e.page_slug = $1 AND e.id = $2`,
@@ -57,6 +64,7 @@ export async function GET(
       hash: row.hash,
     },
     body: erased ? null : row.body,
+    salt: row.salt ? row.salt.toString("hex") : null,
     erased,
     ...(erased && row.erased_reason ? { erased_reason: row.erased_reason } : {}),
   });
