@@ -137,9 +137,12 @@ async function fetchEntries(slug: string): Promise<
     body: string | null;
   }>
 > {
-  // We pass parent_seq (not parent_id) to the LLM since it works in seqs.
-  // The LEFT JOIN handles the case where a parent entry was erased — its
-  // seq is still meaningful for citation purposes.
+  // Pass parent_seq (not parent_id) to the LLM since it works in seqs.
+  // Erased entries (body NULL or erased_at NOT NULL) are filtered out
+  // server-side: they have no body to synthesize, and including them
+  // would just inflate prompt tokens AND cause the LLM to list every
+  // erased entry as "off-topic" by default. Citations stay correct
+  // because the LLM only ever sees seqs that have real bodies.
   const rows = await pool.query<EntryRow>(
     `SELECT
        e.id,
@@ -151,6 +154,8 @@ async function fetchEntries(slug: string): Promise<
      LEFT JOIN entries p ON p.id = e.parent_id
      LEFT JOIN entry_bodies b ON b.entry_id = e.id
      WHERE e.page_slug = $1
+       AND b.body IS NOT NULL
+       AND b.erased_at IS NULL
      ORDER BY e.seq ASC
      LIMIT 1000`,
     [slug],
