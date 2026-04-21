@@ -1,15 +1,10 @@
 /** GET /privacy — serve docs/legal/privacy.md as text/markdown. */
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readRepoFile } from "@/lib/repo-files";
 
-export const dynamic = "force-static";
-export const revalidate = 300;
+export const dynamic = "force-dynamic";
 
 export async function GET(): Promise<Response> {
-  const md = await readFile(
-    join(process.cwd(), "..", "docs", "legal", "privacy.md"),
-    "utf8",
-  );
+  const md = readRepoFile("docs", "legal", "privacy.md");
   return new Response(md, {
     headers: {
       "content-type": "text/markdown; charset=utf-8",

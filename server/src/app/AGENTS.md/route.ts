@@ -5,18 +5,18 @@
  * (we can't have a separate /agents.md/route.ts file because case-insensitive
  * filesystems on macOS would collide it with this directory).
  */
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import { type NextRequest } from "next/server";
 
-export const dynamic = "force-static";
-export const revalidate = 60;
+import { readRepoFile } from "@/lib/repo-files";
+
+// Dynamic on purpose — `force-static` cached the first (broken) attempt at
+// build time and stuck with it. With dynamic rendering each request hits
+// the cached file via readRepoFile (which itself caches in-process).
+export const dynamic = "force-dynamic";
 
 export async function GET(_req: NextRequest): Promise<Response> {
-  // server/ is the Next.js root; AGENTS.md lives in the repo root, ../AGENTS.md
-  const agentsPath = join(process.cwd(), "..", "AGENTS.md");
   try {
-    const md = await readFile(agentsPath, "utf8");
+    const md = readRepoFile("AGENTS.md");
     return new Response(md, {
       headers: {
         "content-type": "text/markdown; charset=utf-8",
