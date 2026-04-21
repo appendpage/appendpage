@@ -43,9 +43,21 @@ import { NextResponse, type NextRequest } from "next/server";
  */
 const READ_ONLY_POST_PATHS: RegExp[] = [/^\/p\/[^/]+\/bodies$/];
 
-function isReadEndpoint(method: string, pathname: string): boolean {
-  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return true;
-  if (method === "POST") {
+/**
+ * For an actual request (GET/POST/...) this returns whether the route is
+ * read-only. For an OPTIONS preflight, the *intended* method is in the
+ * Access-Control-Request-Method header — check that, not "OPTIONS"
+ * itself, otherwise we'd accidentally open CORS on every endpoint.
+ */
+function isReadEndpoint(
+  method: string,
+  pathname: string,
+  preflightMethod: string | null,
+): boolean {
+  const effective =
+    method === "OPTIONS" ? (preflightMethod ?? "GET").toUpperCase() : method;
+  if (effective === "GET" || effective === "HEAD") return true;
+  if (effective === "POST") {
     return READ_ONLY_POST_PATHS.some((re) => re.test(pathname));
   }
   return false;
@@ -55,8 +67,9 @@ export function middleware(req: NextRequest): NextResponse {
   const { pathname } = req.nextUrl;
   const method = req.method;
   const origin = req.headers.get("origin");
+  const preflightMethod = req.headers.get("access-control-request-method");
   const isCrossOrigin = !!origin;
-  const readEndpoint = isReadEndpoint(method, pathname);
+  const readEndpoint = isReadEndpoint(method, pathname, preflightMethod);
 
   // Preflight: handle CORS-OPTIONS directly without dispatching to the
   // route handler. For read endpoints, respond 204 with the allow
