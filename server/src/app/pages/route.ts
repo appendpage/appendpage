@@ -18,6 +18,7 @@ import { NextResponse, type NextRequest } from "next/server";
 
 import { createPage } from "@/lib/chain";
 import { pool } from "@/lib/db";
+import { checkAll, clientIpFromHeaders } from "@/lib/rate-limit";
 import { classifySlug } from "@/lib/slug";
 import { CreatePageRequestSchema } from "@/lib/types";
 
@@ -116,6 +117,27 @@ function shapePageRow(r: PageRow): {
 }
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
+  // Rate-limit before any validation so a spammer can't get a free 400.
+  const ipNorm = clientIpFromHeaders((h) => req.headers.get(h));
+  const rl = await checkAll(ipNorm, "pages", [
+    { configKey: "pages_per_hour", windowSeconds: 3600 },
+    { configKey: "pages_per_day", windowSeconds: 86400 },
+  ]);
+  if (!rl.ok) {
+    return NextResponse.json(
+      {
+        error: "rate_limited",
+        message: `Too many new pages — try again in ~${rl.resetAfterSeconds}s.`,
+        retry_after_seconds: rl.resetAfterSeconds,
+        limit_key: rl.key,
+      },
+      {
+        status: 429,
+        headers: { "retry-after": String(rl.resetAfterSeconds) },
+      },
+    );
+  }
+
   const json = await req.json().catch(() => null);
   const parsed = CreatePageRequestSchema.safeParse(json);
   if (!parsed.success) {

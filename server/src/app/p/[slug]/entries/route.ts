@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { appendEntry } from "@/lib/chain";
+import { checkAll, clientIpFromHeaders } from "@/lib/rate-limit";
 import { ChainError, PostEntryRequestSchema } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -17,6 +18,27 @@ export async function POST(
   { params }: { params: Promise<{ slug: string }> },
 ): Promise<NextResponse> {
   const { slug } = await params;
+
+  // Rate-limit first — cheap read-only Redis check before we touch PG.
+  const ipNorm = clientIpFromHeaders((h) => req.headers.get(h));
+  const rl = await checkAll(ipNorm, "entries", [
+    { configKey: "entries_per_minute", windowSeconds: 60 },
+    { configKey: "entries_per_hour", windowSeconds: 3600 },
+  ]);
+  if (!rl.ok) {
+    return NextResponse.json(
+      {
+        error: "rate_limited",
+        message: `Too many posts — you can try again in ~${rl.resetAfterSeconds}s.`,
+        retry_after_seconds: rl.resetAfterSeconds,
+        limit_key: rl.key,
+      },
+      {
+        status: 429,
+        headers: { "retry-after": String(rl.resetAfterSeconds) },
+      },
+    );
+  }
 
   const json = await req.json().catch(() => null);
   const parsed = PostEntryRequestSchema.safeParse(json);
