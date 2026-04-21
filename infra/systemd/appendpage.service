@@ -8,7 +8,13 @@ Wants=network-online.target
 Type=simple
 User=appendpage
 Group=appendpage
-WorkingDirectory=/var/lib/appendpage/compose/server/.next/standalone
+# WorkingDirectory is the REPO ROOT (not the standalone build output).
+# This lets the markdown route handlers (/AGENTS.md, /privacy, etc.)
+# resolve their files via process.cwd() + relative paths consistent with
+# `npm run dev` from the server/ subdir. The handlers do:
+#     join(process.cwd(), "..", "AGENTS.md")  // dev: cwd=server/  -> repo/AGENTS.md
+# Set cwd to server/ so the same join works in prod from .next/standalone/.
+WorkingDirectory=/var/lib/appendpage/compose/server
 
 # Source the production env file (POSTGRES_PASSWORD, OPENAI_API_KEY, etc.)
 EnvironmentFile=/etc/appendpage/.env
@@ -22,8 +28,9 @@ Environment=NEXT_TELEMETRY_DISABLED=1
 Environment=PAGES_DIR=/var/lib/appendpage/pages
 
 # nvm-installed Node 20 lives under appendpage's home; make it explicit so
-# systemd doesn't fall back to system node 12.
-ExecStart=/var/lib/appendpage/.nvm/versions/node/v20.20.2/bin/node server.js
+# systemd doesn't fall back to system node 12. server.js is in the standalone
+# output dir; we run it from cwd=server/ (see WorkingDirectory above).
+ExecStart=/var/lib/appendpage/.nvm/versions/node/v20.20.2/bin/node .next/standalone/server.js
 
 Restart=on-failure
 RestartSec=5s
