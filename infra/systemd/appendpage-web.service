@@ -1,0 +1,42 @@
+[Unit]
+Description=append.page frontend (Next.js UI, behind nginx)
+Documentation=https://github.com/appendpage/web
+After=network-online.target appendpage.service
+Wants=network-online.target appendpage.service
+
+[Service]
+Type=simple
+User=appendpage
+Group=appendpage
+WorkingDirectory=/var/lib/appendpage/compose-web
+
+EnvironmentFile=/etc/appendpage/.env
+Environment=NODE_ENV=production
+Environment=PORT=38081
+Environment=HOSTNAME=127.0.0.1
+Environment=NEXT_TELEMETRY_DISABLED=1
+# SSR fetches go to the local backend over loopback (skip nginx + TLS).
+Environment=APPEND_PAGE_API_URL=http://127.0.0.1:38080
+Environment=NEXT_PUBLIC_BASE_URL=https://append.page
+
+ExecStart=/var/lib/appendpage/.nvm/versions/node/v20.20.2/bin/node .next/standalone/server.js
+
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/appendpage
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=appendpage-web
+
+[Install]
+WantedBy=multi-user.target
