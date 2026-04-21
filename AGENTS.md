@@ -278,31 +278,45 @@ work as long as the wire format in §2 is stable — no SDK to update,
 no auth to manage, no rate limits to negotiate (read endpoints are
 unmetered).
 
-**What's CORS-open vs CORS-closed:**
+**Every endpoint is CORS-open** — reads, writes, everything. The
+protection that matters is the per-IP Redis rate limit, which fires
+the same way regardless of origin, user-agent, or who built the
+viewer making the request. That gives you three tiers naturally:
 
-| Endpoint                           | CORS  | Why |
-|-----------------------------------|-------|-----|
-| `GET /p/<slug>/raw`               | open  | the canonical chain |
-| `POST /p/<slug>/bodies`           | open  | bulk body fetch (no side effects) |
-| `GET /p/<slug>/e/<id>`            | open  | single body fetch |
-| `GET /p/<slug>/views/doc`         | open  | AI-synthesized doc as JSON |
-| `GET /p/<slug>/views/default`     | open  | legacy AI groupings as JSON |
-| `GET /p/<slug>/tags`              | open  | per-entry tag metadata |
-| `GET /pages`                      | open  | page list / search |
-| `GET /api/spec.json`              | open  | machine-readable spec |
-| `GET /verify.py`                  | open  | the standalone verifier |
-| `POST /p/<slug>/entries`          | **closed** | posting must come from append.page or a CLI |
-| `POST /pages`                     | **closed** | page creation must come from append.page or a CLI |
-| `POST /p/<slug>/views`            | **closed** | custom-view generation (planned, BYOK) |
+- **Individual posting from a personal viewer** — your viewer
+  POSTs to `/p/<slug>/entries` from your browser; your personal IP
+  is well under the cap (currently 30 entries/min, 300/hour, see
+  `rate_limit_config`). Works fine. This is the intended use case.
+- **Building a hosted service that aggregates many users' posts** —
+  your service's single backend IP would hit the rate limit
+  immediately. The use case is naturally prevented by the rate
+  limit, no CORS gate needed.
+- **Drive-by CSRF from a malicious page** — bounded. Each visitor
+  caught by the script contributes at most 30 posts/min before being
+  rate-limited, and the chain still records exactly what was posted
+  so obvious spam can be cleaned via the moderation erasure flow
+  without breaking chain validity.
 
-The reason write endpoints are CORS-closed: per-IP rate limits are how
-we control posting abuse. A third-party in-browser frontend that
-proxied user posts to us would either have to burn its own IP budget
-for every user, or force us to trust an arbitrary `X-Forwarded-For` —
-neither is acceptable. Posts come straight to append.page (or via
-`curl`, which doesn't speak CORS and just gets the standard per-IP
-rate limit treatment from the actual client IP). **Reading is
-decentralizable; writing is centralized to keep the data clean.**
+Endpoints in the open-CORS set:
+
+| Endpoint                          | Notes |
+|-----------------------------------|-------|
+| `GET /p/<slug>/raw`               | the canonical JSONL chain |
+| `POST /p/<slug>/bodies`           | bulk fetch bodies + salts |
+| `GET /p/<slug>/e/<id>`            | single body + salt |
+| `GET /p/<slug>/views/doc`         | AI-synthesized doc as JSON |
+| `GET /p/<slug>/views/default`     | legacy AI groupings as JSON |
+| `GET /p/<slug>/tags`              | per-entry tag metadata |
+| `GET /pages`                      | page list / search |
+| `GET /api/spec.json`              | machine-readable wire spec |
+| `GET /verify.py`                  | the standalone verifier |
+| `POST /p/<slug>/entries`          | append a post (rate-limited per IP) |
+| `POST /pages`                     | create a new page (rate-limited per IP) |
+| `POST /p/<slug>/views`            | custom-view generation (planned, BYOK) |
+
+Read is decentralizable, posting is decentralizable too (one person at
+a time), service-scale aggregation is gated by the rate limiter, not by
+CORS.
 
 If you want to ship something more polished than a 30-line script and
 share it back, the next section walks you through forking the official

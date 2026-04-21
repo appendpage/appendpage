@@ -5,105 +5,72 @@
  * layer disaggregation: the canonical chain is one thing; ANY number of
  * viewers can render it. To make that genuinely true for the most
  * accessible kind of viewer (a static HTML page someone hosts on
- * GitHub Pages, Netlify, their own domain, etc.), we have to actually
- * say so to the browser via Access-Control-Allow-Origin.
+ * GitHub Pages, Netlify, their own domain, an iframe on their blog,
+ * even a file:// page open in a browser tab), we have to say so to the
+ * browser via Access-Control-Allow-Origin.
  *
- * Policy:
+ * Policy: every endpoint is CORS-open (`Access-Control-Allow-Origin: *`).
  *
- *   READ ENDPOINTS  — Access-Control-Allow-Origin: *
- *     Every GET, plus POST /p/<slug>/bodies (which is semantically a
- *     bulk-read with an id list in the body, not a write). Anyone can
- *     fetch the chain, the bodies + salts, the LLM-synthesized doc, the
- *     spec, AGENTS.md, the verifier, etc. from any browser at any
- *     origin.
+ * That includes write endpoints (POST /p/<slug>/entries, POST /pages).
+ * Why open writes too:
  *
- *   WRITE ENDPOINTS — no CORS headers, preflight is denied with 403.
- *     POST /p/<slug>/entries, POST /pages, POST /p/<slug>/views,
- *     POST /p/<slug>/entries/<id>/flag. This is deliberate: per-IP rate
- *     limits are how we control posting abuse. A third-party in-browser
- *     frontend that proxies user posts to us would either burn its own
- *     IP budget for all of its users or force us to trust an arbitrary
- *     X-Forwarded-For — neither is acceptable. So we channel posts
- *     through append.page itself (same-origin, fine) or through CLI /
- *     server-side HTTP clients (which don't speak CORS and just get the
- *     standard per-IP rate-limit treatment from the real client IP).
+ *   1. We want individuals to be able to build their own viewers AND
+ *      compose posts from them — the whole point is that a person with
+ *      an AI coding agent can spin up their own UI in an afternoon.
  *
- * The matcher below excludes Next.js internal routes so we don't
- * intercept /_next/* asset requests with CORS work they don't need.
+ *   2. The protection that matters here is the per-IP Redis rate limit
+ *      (configurable in `rate_limit_config`, see lib/rate-limit.ts).
+ *      Every write hits that limit regardless of origin or user-agent,
+ *      so:
+ *        - An individual posting from their own viewer: their personal
+ *          IP, well under the cap. Fine.
+ *        - Someone building "AnotherAppendPage" that proxies posts for
+ *          many users: the proxy's single IP hits the cap immediately.
+ *          The use case is naturally prevented by the rate limit, no
+ *          CORS gate needed.
+ *        - Drive-by CSRF from a malicious site: bounded — each victim
+ *          can only contribute up to the per-IP cap (currently 30
+ *          posts/min) before being blocked. The chain still proves
+ *          exactly what was posted; cleanup is moderation erasure.
+ *
+ *   3. If we ever see CSRF-driven spam waves in practice, the right
+ *      response is to add a CSRF-token requirement on cross-origin
+ *      writes (which only affects browser writes, not CLI/server-side
+ *      ones), not to globally close the CORS gate.
+ *
+ * The matcher below excludes Next.js internal asset routes so we don't
+ * intercept /_next/* requests with CORS work they don't need.
  */
 import { NextResponse, type NextRequest } from "next/server";
 
-/**
- * POST routes that should be treated as READ endpoints for CORS purposes.
- *
- * /p/<slug>/bodies takes an array of entry ids in its body and returns
- * the matching plaintext + salts; it has no side effects on the server.
- * It's only a POST instead of a GET because URL-length limits on a list
- * of 200 ULIDs are awkward.
- */
-const READ_ONLY_POST_PATHS: RegExp[] = [/^\/p\/[^/]+\/bodies$/];
-
-/**
- * For an actual request (GET/POST/...) this returns whether the route is
- * read-only. For an OPTIONS preflight, the *intended* method is in the
- * Access-Control-Request-Method header — check that, not "OPTIONS"
- * itself, otherwise we'd accidentally open CORS on every endpoint.
- */
-function isReadEndpoint(
-  method: string,
-  pathname: string,
-  preflightMethod: string | null,
-): boolean {
-  const effective =
-    method === "OPTIONS" ? (preflightMethod ?? "GET").toUpperCase() : method;
-  if (effective === "GET" || effective === "HEAD") return true;
-  if (effective === "POST") {
-    return READ_ONLY_POST_PATHS.some((re) => re.test(pathname));
-  }
-  return false;
-}
-
 export function middleware(req: NextRequest): NextResponse {
-  const { pathname } = req.nextUrl;
-  const method = req.method;
   const origin = req.headers.get("origin");
-  const preflightMethod = req.headers.get("access-control-request-method");
   const isCrossOrigin = !!origin;
-  const readEndpoint = isReadEndpoint(method, pathname, preflightMethod);
 
   // Preflight: handle CORS-OPTIONS directly without dispatching to the
-  // route handler. For read endpoints, respond 204 with the allow
-  // headers. For write endpoints (or anything else), respond 403 with
-  // no allow header so the browser refuses to send the actual request.
-  if (method === "OPTIONS" && isCrossOrigin) {
-    if (readEndpoint) {
-      return new NextResponse(null, {
-        status: 204,
-        headers: {
-          "access-control-allow-origin": "*",
-          "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
-          // The only request header we need to allow is content-type for
-          // POST /bodies. Everything else (auth, custom headers) is
-          // intentionally not permitted cross-origin.
-          "access-control-allow-headers": "content-type",
-          "access-control-max-age": "86400",
-          vary: "Origin",
-        },
-      });
-    }
+  // route handler. Always 204 + open allow headers — every endpoint is
+  // open. Same-origin OPTIONS (no Origin header) falls through to the
+  // route handler in case any route wants its own OPTIONS handling.
+  if (req.method === "OPTIONS" && isCrossOrigin) {
     return new NextResponse(null, {
-      status: 403,
-      headers: { vary: "Origin" },
+      status: 204,
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
+        "access-control-allow-headers": "content-type",
+        "access-control-max-age": "86400",
+        vary: "Origin",
+      },
     });
   }
 
-  // Actual request: pass through to the route handler, but tag the
-  // response with CORS headers if it's a cross-origin read.
+  // Actual request: pass through, decorate cross-origin responses with
+  // the allow header. `Vary: Origin` is good practice even with `*` so
+  // caches don't accidentally serve a same-origin variant to a
+  // cross-origin client.
   const response = NextResponse.next();
-  if (readEndpoint && isCrossOrigin) {
+  if (isCrossOrigin) {
     response.headers.set("access-control-allow-origin", "*");
-    // `Vary: Origin` is good practice even with `*` so caches don't
-    // accidentally serve a same-origin variant to a cross-origin client.
     response.headers.set("vary", "Origin");
   }
   return response;

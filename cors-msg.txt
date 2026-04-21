@@ -1,0 +1,31 @@
+CORS: open writes too — rate limit is the protection
+
+Previous policy carved out write endpoints (POST /entries, /pages) as
+CORS-closed under the assumption that allowing cross-origin posts
+opened an unacceptable proxy-abuse vector. On reflection that was
+backwards: the per-IP Redis rate limit IS the protection here, and it
+applies the same way regardless of origin. So:
+
+  - An individual posting from their own viewer (the intended use
+    case — anyone with an AI coding agent should be able to spin up
+    their own UI in an afternoon and have it post) hits their own IP
+    rate budget. Plenty for human use.
+
+  - Anyone trying to build "AnotherAppendPage" that proxies posts for
+    many users would have their service's single backend IP hit the
+    cap immediately. Use case naturally prevented; no CORS gate
+    needed.
+
+  - Drive-by CSRF from a malicious page is bounded — each victim can
+    only contribute up to the per-IP cap (currently 30/min) before
+    being blocked. The chain still records exactly what was posted
+    and the moderation erasure flow can clean obvious spam without
+    breaking chain validity.
+
+If we ever see CSRF-driven spam waves the right response is a
+CSRF-token requirement on cross-origin writes (which only affects
+browser writes, not CLI/server-side ones), not closing the gate.
+
+Middleware shrunk from a read/write split + preflight-method check to
+just "open everything". AGENTS.md §8 rewrites the open-vs-closed
+table as one open table with the rate-limit rationale.
