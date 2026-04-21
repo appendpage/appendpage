@@ -1,21 +1,57 @@
-# AGENTS.md — append.page wire format, API, and viewer guide
+# AGENTS.md — append.page spec
 
-> Specification for the append.page wire format and HTTP API. Written for both humans and coding agents. Served live at <https://append.page/AGENTS.md>, so an agent that discovers the site can fetch this directly without cloning.
+`append.page` is a public, append-only feedback platform. Anyone can post on per-topic pages; once posted, **no one — including the operator — can silently edit or delete** an entry. Bodies can be removed for legal reasons (harassment, doxing, GDPR), but each removal is itself an entry on the chain, so removal is never silent.
+
+This document is the canonical specification for the wire format, the HTTP API, the verifier, and the conventions for building alternative viewers. It is written for both humans and coding agents and is served live at <https://append.page/AGENTS.md>, so an agent can fetch it directly without cloning.
 
 ---
 
-## 1. What append.page is
-
-`append.page` hosts per-topic public pages where anyone can post. Each page is an **append-only chain** of entries. Once an entry is on a chain, **no one can silently edit or delete it** — including the operator. Bodies can be removed for legal reasons (harassment, doxing, GDPR), but body removal is itself a tamper-evident chained event, not a silent deletion.
+## 1. Architecture
 
 Two layers, kept deliberately separate:
 
-- **Data layer** — the append-only chain. Stored in Postgres on the operator's box and mirrored hourly to the public HuggingFace dataset at <https://huggingface.co/datasets/appendpage/ledger>.
-- **Presentation layer** — whatever frontend you're using. The default frontend ([`appendpage/web`](https://github.com/appendpage/web)) renders the chain three ways via a top-of-page pill bar: **Doc** (LLM-synthesized, citation-linked), **Chronological** (raw posts in time order), **Raw JSONL** (canonical wire format). Anyone can build a different frontend that presents the same data differently — see §8.
+- **Data layer** — the append-only chain. Stored in PostgreSQL on the operator's box and mirrored hourly to the public HuggingFace dataset at <https://huggingface.co/datasets/appendpage/ledger>.
+- **Presentation layer** — whatever frontend you're using. The default frontend ([`appendpage/web`](https://github.com/appendpage/web)) renders the chain three ways via a top-of-page pill bar:
+  - **Doc** — LLM-synthesized, citation-linked summary of the page.
+  - **Chronological** — raw posts in time order, newest first.
+  - **Raw JSONL** — the canonical wire format itself.
+
+Every read endpoint is CORS-open, so anyone can write a different frontend at any origin and have it work against the live data — see §9.
 
 ---
 
-## 2. The on-chain entry — 9 fields, freeform-markdown body
+## 2. Quick start
+
+Three commands you can run right now against the live deployment.
+
+**Read a page** — the canonical chain JSONL:
+
+```bash
+curl https://append.page/p/advisors/raw
+```
+
+**Post a comment** — plain JSON, rate-limited per IP (30/min, 300/hr by default):
+
+```bash
+curl -X POST https://append.page/p/advisors/entries \
+  -H 'content-type: application/json' \
+  -d '{"body":"Your post here."}'
+```
+
+**Verify the chain end-to-end** — every hash, every link, every body matches its commitment:
+
+```bash
+curl -O https://append.page/verify.py
+python verify.py https://append.page/p/advisors
+```
+
+`OK: verified N entries, chain intact, ...` means everything checks out.
+
+Detailed reference: schema in §3, full API in §7, verifier in §8.
+
+---
+
+## 3. The on-chain entry — 9 fields, freeform-markdown body
 
 Every entry in every page's chain is a JSON object with exactly these fields:
 
@@ -35,45 +71,45 @@ Every entry in every page's chain is a JSON object with exactly these fields:
 
 | field | type | meaning |
 |---|---|---|
-| `id` | string (ULID, 26 chars, time-ordered, URL-safe) | Stable identifier for this entry. Used in `parent` references and in URLs like `/p/<page>/e/<id>`. |
-| `page` | string (slug) | The page this entry belongs to. Self-describing: an entry detached from its page can still tell you where it came from. |
+| `id` | ULID (26 chars, time-ordered, URL-safe) | Stable identifier. Used in `parent` references and URLs like `/p/<page>/e/<id>`. |
+| `page` | slug string | The page this entry belongs to. Self-describing: an entry detached from its page can still tell you where it came from. |
 | `seq` | non-negative integer | Per-page monotonic sequence (0, 1, 2, ...). Useful for pagination. |
 | `kind` | `"entry"` or `"moderation"` | `entry` = anyone-posted content. `moderation` = operator-issued action (e.g. an erasure record) targeting another entry via `parent`. Posters can only post `entry`. |
-| `parent` | string (id of another entry on the same page), or `null` | If `kind=entry` and `parent != null` → reply to that entry. If `kind=moderation` → the entry being moderated. If `null` → top-level post. |
-| `body_commitment` | `"sha256:" + hex(SHA-256(salt ‖ body_utf8_bytes))` | Cryptographic commitment to the body. The body and salt live off-chain in a private table. See §4. |
-| `created_at` | ISO 8601 UTC timestamp | Server-stamped at append time. Not poster-supplied. |
-| `prev_hash` | `"sha256:" + hex(...)` | Hash of the previous entry on this page. Genesis entry uses `SHA-256("genesis|<slug>|<page_created_at>")`. |
-| `hash` | `"sha256:" + hex(SHA-256(canonical_bytes_of_this_entry_minus_hash))` | Content identifier of this entry. Used by the next entry's `prev_hash` and in `/audit` to verify the chain. |
+| `parent` | ULID of another entry on the same page, or `null` | If `kind=entry` and `parent != null` → reply to that entry. If `kind=moderation` → the entry being moderated. If `null` → top-level post. |
+| `body_commitment` | `"sha256:" + hex(SHA-256(salt ‖ body_utf8_bytes))` | Cryptographic commitment to the body. Body and salt live off-chain in a private table; see §5 for why. |
+| `created_at` | ISO 8601 UTC timestamp | Server-stamped at append time; not poster-supplied. |
+| `prev_hash` | `"sha256:" + hex(...)` | Hash of the previous entry on this page. Genesis uses `SHA-256("genesis|<slug>|<page_created_at>")`. |
+| `hash` | `"sha256:" + hex(SHA-256(canonical_bytes_of_this_entry_minus_hash))` | Content identifier. Used by the next entry's `prev_hash`. |
 
-That is **all** the on-chain entry contains. There is no `target` field, no `tags` field, no `body` field (the body is off-chain). If a poster wants to indicate a subject they write `About Prof. X...` in the body. If they want to tag they write `#funding`. The LLM at presentation time extracts whatever structure the view needs.
+That is **all** the on-chain entry contains. There is no `target` field, no `tags` field, no `body` field (the body is off-chain). If a poster wants to indicate a subject they write `About Prof. X...` in the body. If they want to tag, they write `#funding`. The LLM at presentation time extracts whatever structure each view needs.
 
 ---
 
-## 3. Canonicalization (so writers and verifiers agree)
+## 4. Canonicalization (JCS)
 
-We canonicalize each entry per **RFC 8785 (JCS)** before hashing, so any conforming JCS implementation produces the same `canonical_bytes`. Concretely:
+Each entry is canonicalized per **RFC 8785 (JCS)** before hashing, so any conforming JCS implementation produces the same `canonical_bytes`. Concretely:
 
-- All object keys sorted lexicographically (recursively).
+- Object keys sorted lexicographically (recursively).
 - No whitespace (`{"a":1,"b":2}`, not `{ "a": 1, "b": 2 }`).
 - UTF-8 encoded.
 - Numbers per RFC 8785 (we use only integers in the on-chain entry).
-- Strings escape per RFC 8259 (`\u` sequences only when required).
+- Strings escaped per RFC 8259 (`\u` sequences only when required).
 
-The `hash` field of each entry is computed over the canonical bytes of the entry **minus the `hash` field itself**. The chain links via `prev_hash` (hash of the previous entry) — this is the cryptographic glue.
+The `hash` field is computed over the canonical bytes of the entry **minus the `hash` field itself**. The chain links via `prev_hash` (the hash of the previous entry) — this is the cryptographic glue.
 
-A reference TypeScript implementation lives at `server/src/lib/jcs.ts`; a reference Python implementation is in `tools/verify.py`. Both wrap the standard JCS libraries (`canonicalize` on npm, `jcs` on PyPI).
+Reference implementations: TypeScript at `server/src/lib/jcs.ts`, Python at `tools/verify.py`. Both wrap the standard JCS libraries (`canonicalize` on npm, `jcs` on PyPI; the verifier has a stdlib-only fallback).
 
 ---
 
-## 4. The chain (id vs hash, replies, erasure)
+## 5. The chain — links and erasure
 
 ### `id` vs `hash`
 
-| | `id` | `hash` |
+|  | `id` | `hash` |
 |---|---|---|
-| **what** | ULID, stable, URL-friendly | SHA-256 of the entry's canonical bytes |
+| **what** | ULID, stable, URL-friendly | SHA-256 of the canonical bytes |
 | **purpose** | URL ergonomics, `parent` references | tamper-evidence (next entry's `prev_hash`) |
-| **changes if you tamper?** | no (it's a free identifier) | yes (any byte change → different hash) |
+| **changes if anyone tampers?** | no (it's a free identifier) | yes (any byte change → different hash) |
 
 ### Chain structure
 
@@ -88,64 +124,75 @@ entry[2]: { id: C, seq: 2, prev_hash: H_B,           hash: H_C }
 
 A linear singly-linked list. To verify, walk forward: recompute each entry's `hash` from its bytes; check `prev_hash` matches the previous entry's `hash`. Any broken link = tampering.
 
-### Linking — chain by hash, replies by id
-
 - **Chain link** (`prev_hash`) → by **hash**. Has to be a hash for tamper-evidence.
-- **Reply link** (`parent`) → by **id**. The parent's `hash` never changes (body erasure doesn't change the on-chain entry, only the off-chain body+salt), so id and hash are equivalent here; id wins on brevity.
+- **Reply link** (`parent`) → by **id**. The parent's `hash` never changes (body erasure doesn't touch the on-chain entry, only the off-chain body+salt), so id and hash are equivalent here; id wins on brevity.
 
-### What happens when something is removed by law
+### Erasure (body removal under the law)
 
-Bodies live off-chain in a private `entry_bodies(entry_id, body, salt, ...)` table. The on-chain entry only commits to `H(salt ‖ body)`.
+Bodies live off-chain in a private `entry_bodies(entry_id, body, salt, ...)` table. The on-chain entry only commits to `H(salt ‖ body)`. When the operator honors an erasure request:
 
 ```
-Erasure flow (operator triggered by a request):
-  1. UPDATE entry_bodies SET body='', erased_at=now(), erased_reason=... WHERE entry_id = X.
-  2. Append a NEW entry to the chain with kind="moderation", parent=X,
-     body explaining the action ("Erased on request. Reason: harassment.").
-
-Result on the chain:
-  - Entry X is unchanged. body_commitment, prev_hash, hash all intact.
-  - Chain still verifies end-to-end (no broken links).
-  - Fetching X's body via the API returns {erased: true, erased_reason: "..."}.
-  - The kind=moderation entry is permanent public record of the action.
-  - body_commitment proves something specific WAS committed at X. Anyone
-    who saved (body, salt) before erasure can still verify their copy
-    matches by computing H(salt ‖ body) and comparing.
+1. UPDATE entry_bodies
+     SET body='', erased_at=now(), erased_reason='...'
+     WHERE entry_id = X.
+2. Append a NEW entry with kind="moderation", parent=X, and a body
+   explaining the action ("Erased on request. Reason: harassment.").
 ```
 
-This is the property that justifies the salted-commitment complexity. Erasure removes our ability to *serve* the body; it does not remove the *fact* that something was committed at that position, and it does not invalidate the chain.
+What's left on the chain afterwards:
+
+- Entry X is unchanged. `body_commitment`, `prev_hash`, `hash` all intact.
+- Chain still verifies end-to-end (no broken links).
+- `GET /p/<slug>/e/<id>` returns `{erased: true, erased_reason: "..."}`.
+- The `kind=moderation` entry is the permanent public record of the action.
+- `body_commitment` proves something specific *was* committed at X. Anyone who saved `(body, salt)` before erasure can still verify their copy by computing `SHA-256(salt ‖ body)` and comparing.
+
+This is what justifies the salted-commitment complexity: erasure removes our ability to *serve* the body; it does not remove the *fact* that something was committed at that position, and it does not invalidate the chain.
 
 ---
 
-## 5. Tamper-evidence — what's actually guaranteed
+## 6. What's guaranteed (and what isn't)
 
-Honest framing of what the chain guarantees, in increasing order of strength:
+Honest framing of what the chain proves, in increasing order of difficulty to attack:
 
-1. **Body matches commitment** — guaranteed without any external observer. Anyone who fetches `(body, salt)` and computes `H(salt ‖ body)` can check it matches the on-chain `body_commitment`. If the operator silently changes a body, this fails immediately.
-2. **Chain is internally consistent** — guaranteed without any external observer. Anyone with the current JSONL can verify all `hash` values and all `prev_hash` links. Editing/deleting/reordering one entry breaks the chain.
-3. **No retroactive editing/deletion since some past observation** — requires that **at least one party** has saved a snapshot of the chain (or just the head hash) at any past moment. They re-fetch and diff. This is the "weak assumption" that delivers the headline product promise. The HuggingFace dataset (Git-versioned, hourly push) makes this trivial — anyone who clones the dataset at any past point has a snapshot the operator cannot reach.
-4. **Chain wasn't fabricated from genesis before anyone first looked** — **NOT guaranteed.** Closing this would require a global tamper-proof timestamp on the genesis hash (e.g. anchoring to a public blockchain), which we don't do. For now, the more downloads and clones exist in the wild, the smaller the undetected-rewrite window.
+| # | Guarantee | Strength | Requires |
+|---|---|---|---|
+| 1 | Body matches the on-chain commitment | strong | nothing — anyone with `(body, salt)` can compute `SHA-256(salt ‖ body)` and compare |
+| 2 | Chain is internally consistent | strong | nothing — anyone with the JSONL can recompute every `hash` and verify every `prev_hash` link |
+| 3 | No retroactive editing/deletion since some past observation | conditional | one external party with a snapshot — even just the head hash — at any past moment |
+| 4 | Chain wasn't fabricated from genesis before anyone first looked | **not guaranteed** | a global tamper-proof timestamp on the genesis hash (e.g. anchoring to a public blockchain), which we do not currently have |
 
-We deliberately do not claim things the math doesn't support.
+(1) and (2) hold even if no one is watching. (3) is the property that delivers the headline product promise — and the hourly HuggingFace mirror makes it cheap to satisfy: anyone who clones the dataset at any past point has a snapshot the operator cannot reach. (4) is the limit of what we currently claim. We deliberately do not claim things the math doesn't support.
 
 ---
 
-## 6. HTTP API
+## 7. HTTP API
 
-Base URL: `https://append.page`. Machine-readable spec: `GET /api/spec.json`.
+Base URL: `https://append.page` (or your own backend if you've deployed a fork).
+Machine-readable spec: `GET /api/spec.json`.
 
-**Every endpoint is CORS-open** (`Access-Control-Allow-Origin: *`) — read or write — so a browser at any origin can call them. Per-IP rate limits do all the abuse protection; see [Conventions](#conventions) below.
+### Conventions (apply to every endpoint)
 
-### Read
+- **CORS.** Every endpoint, read or write, sets `Access-Control-Allow-Origin: *`. A browser at any origin can call them. Per-IP rate limits do all the abuse protection.
+- **Rate limits.** Per-IP, configured in the `rate_limit_config` PG table and tunable at runtime. Defaults: **30 entries/min, 300 entries/hr, 10 pages/hr, 40 pages/day**. Returned as `429 Too Many Requests` with a `Retry-After` header.
+- **Optimistic concurrency.** On `POST /p/:slug/entries`, send `Expect-Prev-Hash: <hash>`; if it doesn't match the current head, returns `409 Conflict` with `{actual_head_hash}`.
+- **Bulk download.** `git clone https://huggingface.co/datasets/appendpage/ledger` — every page as JSONL plus `verify.py`, refreshed hourly.
+
+### Read — page data
 
 | method | path | returns |
 |---|---|---|
-| `GET` | `/p/:slug/raw` | `application/x-ndjson` — one canonical JSON entry per line, in chain order. **This is the canonical data**; everything else is a presentation of it. |
-| `POST` | `/p/:slug/bodies` | `{entries: [{entry, body, salt, erased, erased_reason?}]}` — bulk-fetch bodies for up to 200 entry ids in one request body `{ids: string[]}`. `salt` is 64-char hex and is returned for every entry (erased or not), so anyone with a private body archive can re-verify offline. Erased entries return `body: null`. |
-| `GET` | `/p/:slug/e/:id` | Single-entry version of the above: `{entry, body, salt, erased, erased_reason?}`. |
-| `GET` | `/p/:slug/views/doc` | `{view, head_hash, cached, cost_usd, generated_at, entry_seq_to_id}` — the AI-synthesized Doc View as JSON. Cached on `(page, prompt, head_hash)`. Add `?stale_ok=1` for stale-while-revalidate semantics. |
-| `GET` | `/pages` | `{pages: [{slug, description, entry_count, last_post_at}]}` — list / search pages. `?sort=active` for most-recent (default); `?q=foo` for substring search. |
-| `GET` | `/api/spec.json` | Machine-readable spec (entry schema + endpoints). |
+| `GET`  | `/p/:slug/raw` | The canonical chain as `application/x-ndjson` (one JCS-canonical entry per line). **This is the canonical data;** every other endpoint is a presentation of it. |
+| `POST` | `/p/:slug/bodies` | Bulk-fetch bodies + salts for up to 200 entry ids. Body: `{ids: string[]}`. Returns: `{entries: [{entry, body, salt, erased, erased_reason?}]}`. `salt` is 64-char hex and is returned for every entry (erased or not), so anyone with a private body archive can re-verify offline. |
+| `GET`  | `/p/:slug/e/:id` | Single entry: `{entry, body, salt, erased, erased_reason?}`. |
+| `GET`  | `/p/:slug/views/doc` | LLM-synthesized Doc View as JSON: `{view, head_hash, cached, generated_at, entry_seq_to_id}`. Cached on `(page, prompt, head_hash)`. Add `?stale_ok=1` for stale-while-revalidate. |
+| `GET`  | `/pages` | Page list / search. `?sort=active` (default) returns most recently active; `?q=<text>` returns substring matches on slug + description. |
+
+### Read — resources
+
+| method | path | returns |
+|---|---|---|
+| `GET` | `/api/spec.json` | This API as a JSON Schema document. |
 | `GET` | `/AGENTS.md` | This document, as `text/markdown`. |
 | `GET` | `/verify.py` | The standalone chain + body verifier (one Python file, stdlib only). |
 | `GET` | `/status` | Liveness JSON: `{uptime, last_anchor_at, free_disk_bytes, llm_budget_remaining_today_usd}`. |
@@ -154,57 +201,52 @@ Base URL: `https://append.page`. Machine-readable spec: `GET /api/spec.json`.
 
 | method | path | body | returns |
 |---|---|---|---|
-| `POST` | `/p/:slug/entries` | `{body: string, parent_id?: string}` | `{entry}` — the canonical entry that just got committed (with `id`, `hash`, `prev_hash`, `seq`). |
-| `POST` | `/pages` | `{slug: string, description?: string}` | `{slug, status: "live"\|"queued_review"}` — `queued_review` if the slug looks like a personal name. |
-
-### Conventions
-
-- **Rate limits** are per-IP, configured in the `rate_limit_config` table and tunable at runtime. Defaults: 30 entries/min/IP, 300 entries/hr/IP, 10 pages/hr/IP, 40 pages/day/IP. Returned as `429 Too Many Requests` with a `Retry-After` header.
-- **Optimistic concurrency** on `POST /p/:slug/entries`: send `Expect-Prev-Hash: <hash>`; if it doesn't match the current head, returns `409 Conflict` with `{actual_head_hash}`.
-- **Bulk download:** `git clone https://huggingface.co/datasets/appendpage/ledger` — every page's JSONL plus `verify.py`, refreshed hourly.
+| `POST` | `/p/:slug/entries` | `{body: string, parent_id?: string}` | `{entry}` — the canonical entry that was just committed. |
+| `POST` | `/pages` | `{slug: string, description?: string}` | `{slug, status: "live" \| "queued_review"}` — `queued_review` means the slug looks like a personal name and needs operator review before going live. |
 
 ---
 
-## 7. Verify a chain (and every body) in one command
+## 8. Verifier — `verify.py`
 
 ```bash
 curl -O https://append.page/verify.py
 python verify.py https://append.page/p/advisors
 ```
 
-That fetches the chain, fetches every body+salt, and checks four properties per entry:
+This fetches the chain and every body+salt, and checks four properties for each entry:
 
 1. `hash == SHA-256(JCS(entry_minus_hash))`
 2. `prev_hash == previous_entry.hash`
 3. `seq` increments by 1 from 0; `page` is constant across the chain
-4. For non-erased entries: `body_commitment == SHA-256(salt || body)`
+4. For non-erased entries: `body_commitment == SHA-256(salt ‖ body)`
 
-Erased entries skip step 4 (no body to check), but their chain link is still verified.
+Erased entries skip step 4 (no body to check); their chain link is still verified.
 
-Exit code `0` = everything intact. Exit code `1` = something is broken (details on stderr).
+Exit code `0` = everything intact. Exit code `1` = something is broken (failure details on stderr).
 
-Other modes:
+### Other modes
 
 ```bash
-# Offline / from the HuggingFace mirror — chain only:
+# Offline / from the HuggingFace mirror — chain only
 python verify.py path/to/page.jsonl
 
 # Body check from a private archive: assemble bodies.json yourself as
-# {entry_id: {body, salt}} and pass:
+# {entry_id: {body, salt}} (salt is hex; available from /p/<slug>/bodies
+# even for entries that have since been erased)
 python verify.py path/to/page.jsonl --with-bodies path/to/bodies.json
 ```
 
-The verifier is one stdlib-only Python file (`urllib`, `hashlib`, `json` + the `jcs` PyPI package for RFC 8785 canonicalization, with a byte-equivalent fallback if `jcs` isn't installed). It ships in this repo at `tools/verify.py` and is copied into every HuggingFace dataset push.
+The verifier is one stdlib-only Python file (`urllib`, `hashlib`, `json` + the `jcs` PyPI package for RFC 8785, with a byte-equivalent fallback if `jcs` isn't installed). It ships at `tools/verify.py` and is copied into every HuggingFace dataset push.
 
 ---
 
-## 8. Build your own viewer
+## 9. Build your own viewer
 
-Anyone can build a viewer for append.page. The data layer is public, every read endpoint is CORS-open, and the wire format in §2 is small and stable. Two paths, depending on how polished you want to get.
+The data layer is public, every read endpoint is CORS-open, and the wire format in §3 is small and stable. Anyone can build a different viewer at any origin and have it work against the live data.
 
-### Path 1: a 30-line static page
+### The minimum viewer — one HTML file
 
-The simplest viewer is a single HTML file you serve from anywhere — your own domain, GitHub Pages, an `<iframe>` on your blog, even `file://` open in a browser tab:
+Serve this from your own domain, GitHub Pages, an `<iframe>` on a blog, or even `file://` open in a browser tab:
 
 ```html
 <!doctype html>
@@ -226,57 +268,49 @@ The simplest viewer is a single HTML file you serve from anywhere — your own d
   }).then((r) => r.json());
   const bodyById = Object.fromEntries(resp.entries.map((e) => [e.entry.id, e]));
 
-  // Render however you want. (Optionally also fetch
-  // `${base}/p/${slug}/views/doc` to get the AI-synthesized doc as JSON.)
+  // Render however you want. Optionally also fetch
+  // `${base}/p/${slug}/views/doc` to get the AI-synthesized doc as JSON.
   document.body.innerHTML = chain
     .map((e) => {
       const b = bodyById[e.id];
-      const text = b.erased ? "[erased]" : b.body;
-      return `<article><h3>#${e.seq}</h3><pre>${text}</pre></article>`;
+      return `<article><h3>#${e.seq}</h3><pre>${b.erased ? "[erased]" : b.body}</pre></article>`;
     })
     .join("");
 </script>
 ```
 
-This will keep working as long as the wire format stays stable — no SDK to update, no auth, read endpoints are unmetered. To let visitors of your viewer also **post**, just add a textarea + a `fetch(..., {method: "POST"})` to `/p/<slug>/entries`. The per-IP rate limit is the only gate; service-scale aggregators naturally hit their own ceiling because all their traffic comes from one IP, so you can't accidentally build something that abuses the platform on behalf of others.
+To support **posting** from your viewer, add a textarea and a `fetch(..., {method:"POST"})` to `/p/<slug>/entries`. Per-IP rate limits are the only gate; service-scale aggregators naturally hit their own ceiling because all their traffic comes from one IP, so individual viewers work freely while platform-style abuse is structurally prevented.
 
-### Path 2: fork the official frontend
+### Or fork the official frontend
 
-If you want a fully-featured starting point, clone [`appendpage/web`](https://github.com/appendpage/web), point it at `https://append.page` (or your own backend), and redesign:
+For a polished starting point, clone [`appendpage/web`](https://github.com/appendpage/web), point it at the public backend, and redesign:
 
 ```bash
 git clone https://github.com/appendpage/web my-viewer
 cd my-viewer
-cp .env.example .env   # contains APPEND_PAGE_API_URL=https://append.page
-npm install
-npm run dev
+cp .env.example .env   # APPEND_PAGE_API_URL=https://append.page
+npm install && npm run dev
 ```
 
-You now have a fully working alternative viewer on `localhost:3000` reading the same canonical data the official frontend uses. Layout, colors, typography, what the Doc view looks like, how moderation entries render — all yours.
+You now have the full Doc / Chronological / Raw frontend on `localhost:3000`, reading the same canonical data the official one uses. Layout, colors, typography, what the Doc view looks like, how moderation entries render — all yours.
 
-The contract worth keeping:
+### Conventions worth keeping
 
-- **The view-switcher pill bar** (`Doc / Chronological / Raw JSONL`). This is what makes the data/presentation split visible to a non-technical visitor.
-- **Honest framing of tamper-evidence** — see §5. Don't claim more than the math supports.
-- **A single freeform-markdown body textarea** for posting. Don't force structured fields on posters.
+- **The view-switcher pill bar** (`Doc / Chronological / Raw JSONL`). This is what makes the data/presentation split visible to a non-technical visitor; don't hide it.
+- **Honest framing of tamper-evidence** — see §6. Don't claim more than the math supports.
+- **A single freeform-markdown body textarea** for posting. Don't force structured fields on posters; the LLM extracts structure at presentation time.
 
-Deploy yours wherever. If you'd like it featured as an alternative visualizer, open a GitHub issue.
+If you'd like your viewer featured as an alternative visualizer at append.page, open a [GitHub issue](https://github.com/appendpage/appendpage/issues).
 
 ---
 
-## 9. Operator and legal
+## 10. Operator, legal, and document status
 
 - **Operator:** [@da03](https://github.com/da03) (Yuntian Deng), University of Waterloo. Personal research project, not a University of Waterloo service.
-- **Contact:** [GitHub issues](https://github.com/appendpage/appendpage/issues) for everything — questions, erasure requests, takedowns, abuse reports. Security disclosures via [GitHub Security Advisories](https://github.com/appendpage/appendpage/security/advisories/new). Details in [`docs/legal/contact.md`](./docs/legal/contact.md).
+- **Contact:** [GitHub issues](https://github.com/appendpage/appendpage/issues) for everything — questions, erasure requests, takedowns, abuse reports. Security disclosures via [GitHub Security Advisories](https://github.com/appendpage/appendpage/security/advisories/new). Full details in [`docs/legal/contact.md`](./docs/legal/contact.md).
 - **Privacy notice:** [`docs/legal/privacy.md`](./docs/legal/privacy.md) — short, honest, describes what the deployed code actually does.
 - **Terms of use:** [`docs/legal/terms.md`](./docs/legal/terms.md).
 
----
-
-## 10. Status of this document
-
-This document tracks the wire format and HTTP API as currently deployed at <https://append.page>. Any field or endpoint described here is one you can call against the live server today. Track changes via the GitHub repo's commit history.
-
----
+This document tracks the live deployment at <https://append.page>. Any field or endpoint described above is one you can call against the server today; track changes via the GitHub repo's commit history.
 
 *Last updated: 2026-04-21.*

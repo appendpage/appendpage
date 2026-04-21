@@ -2,7 +2,7 @@
 
 ## What we're protecting
 
-- **Chain integrity.** No silent edits, no silent deletions, no silent reorderings of past entries — given the assumption in `AGENTS.md §5` that at least one third party has a snapshot of the chain at any past point. (Body changes are detectable without that assumption.)
+- **Chain integrity.** No silent edits, no silent deletions, no silent reorderings of past entries — given the assumption in `AGENTS.md §6` that at least one third party has a snapshot of the chain at any past point. (Body changes are detectable without that assumption.)
 - **Erasure honesty.** When a body is removed, the removal is on-chain and permanent record. We never silently drop a body.
 - **Poster privacy.** Posters' IP addresses and User-Agents are never stored in plaintext, never published, and the `ip_hash` rotates daily with a 7-day window.
 - **BYOK key handling.** A visitor's `byok_key` for the Custom-view feature is held only in request-scoped memory. Never logged, never persisted, never sent anywhere except OpenAI itself.

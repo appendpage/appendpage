@@ -2,7 +2,7 @@
  * Shared types and Zod schemas for the v0 wire format.
  *
  * The on-chain entry has 9 fields. Posters write the body; the server fills
- * everything else. See AGENTS.md §2 for the human-readable spec.
+ * everything else. See AGENTS.md §3 for the human-readable spec.
  */
 import { z } from "zod";
 

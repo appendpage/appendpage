@@ -76,7 +76,7 @@ const SPEC = {
       method: "POST",
       path: "/p/{slug}/entries",
       summary:
-        "Append an entry to a page's chain. Rate-limited per IP; see /AGENTS.md §6.",
+        "Append an entry to a page's chain. Rate-limited per IP; see /AGENTS.md §7.",
       request: {
         type: "object",
         additionalProperties: false,

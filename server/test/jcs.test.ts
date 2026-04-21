@@ -49,7 +49,7 @@ describe("jcs", () => {
     expect(entryHash(e1).hash).toEqual(entryHash(e2).hash);
   });
 
-  it("body_commitment matches H(salt || body) per AGENTS.md §2", () => {
+  it("body_commitment matches H(salt || body) per AGENTS.md §3", () => {
     const salt = Buffer.alloc(32, 0x42);
     const body = "hello world";
     const expected = sha256Hex(Buffer.concat([salt, Buffer.from(body, "utf8")]));

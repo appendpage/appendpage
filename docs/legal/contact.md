@@ -28,7 +28,3 @@ Every action we take in response to a request is logged publicly at `/p/<slug>/m
 
 - **Name:** Yuntian Deng
 - **GitHub:** [@da03](https://github.com/da03) (private contact links are on the GitHub profile)
-- **Affiliation:** University of Waterloo (this site is a personal research project, not a University of Waterloo service)
-- **Server location:** Finland
-
-This is an experimental research demo. There is no SLA and no guaranteed response time; best effort.
