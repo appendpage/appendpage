@@ -220,10 +220,10 @@ step_obtain_cert() {
     log "certbot cert for $DOMAIN already present — skipping issuance"
     return
   fi
-  # NOTE: $WWW_DOMAIN is intentionally NOT included by default — DNS may not
-  # have an A record for www. Set INCLUDE_WWW=1 to include it.
+  # Include www by default (DNS A record was added 2026-04-21). Set
+  # INCLUDE_WWW=0 to opt out if you ever deploy this without a www record.
   local -a www_args=()
-  if [[ "${INCLUDE_WWW:-0}" == "1" ]]; then
+  if [[ "${INCLUDE_WWW:-1}" == "1" ]]; then
     www_args+=("-d" "$WWW_DOMAIN")
   fi
   log "obtaining TLS cert for $DOMAIN${INCLUDE_WWW:+ + $WWW_DOMAIN} via certbot --webroot"

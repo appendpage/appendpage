@@ -27,12 +27,6 @@ export default function Page() {
         removal itself becomes a permanent public record.
       </p>
 
-      <p style={{ color: "#555", fontSize: "0.95em" }}>
-        Experimental research demo by{" "}
-        <a href="https://github.com/da03">@da03</a>&apos;s group. No SLA. May go
-        down at any time.
-      </p>
-
       <h2 style={{ fontSize: "1.1rem", marginTop: "2rem" }}>For humans</h2>
       <ul>
         <li>
@@ -73,7 +67,7 @@ export default function Page() {
         <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> ·{" "}
         <a href="/contact">Contact</a> · <a href="/status">Status</a>
         <br />
-        Experimental demo · no SLA · may go down at any time
+        Run by <a href="https://github.com/da03">@da03</a>. Open source, MIT.
       </footer>
     </main>
   );

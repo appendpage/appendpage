@@ -16,7 +16,7 @@ This is the **backend** repo. The default frontend lives at [`appendpage/web`](h
 
 ## Status
 
-Experimental research demo by Yuntian Deng's group. No SLA. May go down at any time. See [`docs/legal/terms.md`](./docs/legal/terms.md).
+Built and operated by [Yuntian Deng's group](https://yuntiandeng.com/). See [`docs/legal/terms.md`](./docs/legal/terms.md) for the full terms of use.
 
 ## What it does (one paragraph)
 

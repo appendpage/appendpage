@@ -255,7 +255,7 @@ The reference implementation in this repo at `appendpage/server/` is ~2000 lines
 - **Operator:** [@da03](https://github.com/da03) (Yuntian Deng).
 - **Contact:** see [`docs/legal/contact.md`](./docs/legal/contact.md) — single email for erasure, takedown, abuse, general questions.
 - **Privacy notice:** [`docs/legal/privacy.md`](./docs/legal/privacy.md).
-- **Terms:** [`docs/legal/terms.md`](./docs/legal/terms.md). Research demo. No SLA. May go down at any time.
+- **Terms of use:** [`docs/legal/terms.md`](./docs/legal/terms.md).
 
 ---
 
