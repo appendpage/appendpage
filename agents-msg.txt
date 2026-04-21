@@ -1,0 +1,51 @@
+AGENTS.md: tighten + drop "Build your own backend"
+
+The doc had drifted: read endpoints landed in the Write table,
+endpoints were listed that aren't deployed (anchor.txt, anchor/
+latest.txt), forking instructions referenced a codegen script that
+doesn't exist, view-switcher labels named the old "AI view" instead
+of the deployed "Doc / Chronological / Raw JSONL", and a "Build
+your own backend" section pulled focus from the actual canonical
+extension story (build a viewer).
+
+Rewrite goals: clear, intuitive, simple. One concept per section,
+honest about what's deployed.
+
+Structure (10 sections):
+  1. What append.page is (data + presentation split)
+  2. The on-chain entry — 9 fields
+  3. Canonicalization (JCS)
+  4. The chain (id vs hash, replies, erasure)
+  5. Tamper-evidence — what's actually guaranteed
+  6. HTTP API
+  7. Verify a chain in one command
+  8. Build your own viewer (merged: 30-line static page + fork
+     the official frontend, both as variants of one story)
+  9. Operator and legal
+ 10. Status
+
+Concrete fixes:
+  - Drop §10 "Build your own backend" entirely. The audience we want
+    to invite to extend the platform are people building viewers,
+    not backends.
+  - Merge the old §8 (no-fork viewer) and §9 (fork the frontend)
+    into one §8 with two paths: 30-line static page, or fork the
+    official frontend.
+  - §6 Read table: add /views/doc, /pages, /verify.py, /AGENTS.md;
+    move POST /bodies and GET /e/:id from Write to Read (they have
+    no side effects). Drop the dead /anchor.txt + /anchor/latest.txt
+    + the duplicate /audit HTML row.
+  - §6 Write table: just POST /entries and POST /pages. Single
+    paragraph on rate limits + concurrency replaces a longer table.
+  - §7: drop the duplicated "Exit code 0/1" line.
+  - §8 fork instructions: drop the broken "npm run codegen-types"
+    step. Update the contract bullets to match the deployed view
+    labels (Doc / Chronological / Raw JSONL).
+  - §5: drop the dead /about link.
+  - §1: name the actual three views and the pill-bar ordering.
+
+  - CORS framing condensed into one line at the top of §6 ("every
+    endpoint is CORS-open; per-IP rate limits do all the abuse
+    protection") rather than a 100-line section.
+
+  - "Last updated" → 2026-04-21.
