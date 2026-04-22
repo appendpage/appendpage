@@ -235,7 +235,12 @@ function backgroundRegenerate(
         `INSERT INTO view_cache
            (page_slug, view_prompt_hash, head_hash, view_json, tokens_used, cost_usd)
          VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (page_slug, view_prompt_hash, head_hash) DO NOTHING`,
+         ON CONFLICT (page_slug, view_prompt_hash, head_hash)
+           DO UPDATE SET
+             view_json   = EXCLUDED.view_json,
+             tokens_used = EXCLUDED.tokens_used,
+             cost_usd    = EXCLUDED.cost_usd,
+             created_at  = now()`,
         [
           slug,
           pHash,
@@ -497,11 +502,20 @@ export async function GET(
     );
   }
 
+  // Inline-generation cache write. UPDATE on conflict so a `?nocache=1`
+  // request that lands when an old row exists will actually overwrite
+  // (the previous DO NOTHING semantics silently dropped the new doc and
+  // kept serving stale shape — bit us once during the Phase 2 rollout).
   await pool.query(
     `INSERT INTO view_cache
        (page_slug, view_prompt_hash, head_hash, view_json, tokens_used, cost_usd)
      VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (page_slug, view_prompt_hash, head_hash) DO NOTHING`,
+     ON CONFLICT (page_slug, view_prompt_hash, head_hash)
+       DO UPDATE SET
+         view_json   = EXCLUDED.view_json,
+         tokens_used = EXCLUDED.tokens_used,
+         cost_usd    = EXCLUDED.cost_usd,
+         created_at  = now()`,
     [
       slug,
       pHash,
