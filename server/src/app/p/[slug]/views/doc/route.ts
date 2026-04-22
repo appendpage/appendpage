@@ -7,6 +7,25 @@
  * different view_prompt_hash, so the rows live side-by-side in the
  * `view_cache` table without conflict).
  *
+ * Two synthesis pipelines coexist behind the DOC_VIEW_V2 env flag:
+ *
+ *   v1 (lib/docview.ts)    — single LLM call covering all entries.
+ *                            Always available as a fallback.
+ *   v2 (lib/docview-v2.ts) — per-subject incremental synthesis: tag
+ *                            entries via lib/tags, group by subject,
+ *                            one LLM call per cluster, intro from
+ *                            section summaries. Sections grow with
+ *                            their member-post count.
+ *
+ * v2 is enabled when DOC_VIEW_V2=1. Any exception inside the v2 path
+ * is caught and the v1 path runs as fallback, so a v2 bug never
+ * surfaces a 5xx to the user.
+ *
+ * The page-level cache (view_cache) keys both pipelines under
+ * different view_prompt_hash values: v1 hashes the v1 prompt text,
+ * v2 hashes a synthetic "doc-v2:<section_prompt_version>:<intro_prompt_version>"
+ * marker. Rows coexist; flipping the flag never invalidates either.
+ *
  * Query flags (mirror of /views/default for caller consistency):
  *   ?stale_ok=1   — serve the most recent cached doc for this (slug,
  *                   prompt) even if head_hash has moved on; kick off a
@@ -15,7 +34,8 @@
  *   ?cache_only=1 — never call the LLM; 204 if no exact-head row exists.
  *   ?nocache=1    — always call the LLM inline and overwrite cache.
  *   (default)     — cache hit returns immediately; cache miss calls the
- *                   LLM inline (60s timeout).
+ *                   LLM inline (60s timeout for v1, ~120s for v2 first
+ *                   generation since per-section calls run in parallel).
  *
  * Responses:
  *   200  { view, head_hash, cached, stale?, cache_head_hash?,
@@ -23,11 +43,8 @@
  *          entry_seq_to_id }
  *   204  empty page, OR no cached doc AND (cache_only|stale_ok with no cache)
  *   503  budget exceeded
- *
- * `entry_seq_to_id` is a small map { "5": "01K...", "12": "01K..." }
- * that the frontend uses to turn citation [#N] markers into deep links
- * to the matching entry's permalink anchor (#e-<id>).
  */
+import { createHash } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { pool } from "@/lib/db";
@@ -37,6 +54,11 @@ import {
   docPromptFor,
   docPromptHash,
 } from "@/lib/docview";
+import {
+  buildDocV2,
+  INTRO_PROMPT_VERSION,
+  SECTION_PROMPT_VERSION,
+} from "@/lib/docview-v2";
 import { BudgetExceededError } from "@/lib/llm";
 import { redis } from "@/lib/redis";
 
@@ -63,23 +85,115 @@ interface EntryRow {
   kind: string;
   parent_seq: number | null;
   body: string | null;
+  body_commitment: string;
+}
+
+/** v2 enabled? Read at request time so an env change takes effect on
+ *  service reload without redeploy. */
+function useV2(): boolean {
+  return process.env.DOC_VIEW_V2 === "1";
+}
+
+/**
+ * Cache key for v2 docs. Distinct from v1's `docPromptHash` (which hashes
+ * the literal v1 prompt text) so v1 and v2 cache rows coexist in
+ * `view_cache` and flipping DOC_VIEW_V2 never invalidates either.
+ */
+function v2PromptHash(): string {
+  const marker = `doc-v2|${SECTION_PROMPT_VERSION}|${INTRO_PROMPT_VERSION}`;
+  return "sha256:" + createHash("sha256").update(marker).digest("hex");
+}
+
+/**
+ * Try the v2 builder, fall back to v1 on any exception other than
+ * BudgetExceeded. Returns a uniform shape so the caller can store it in
+ * view_cache and respond identically regardless of which produced it.
+ */
+async function buildDocOrFallback(args: {
+  slug: string;
+  description: string;
+  v1Prompt: string;
+  v1Entries: Array<{
+    seq: number;
+    kind: string;
+    parent_seq: number | null;
+    body: string | null;
+  }>;
+  v2Entries: Array<{
+    id: string;
+    seq: number;
+    kind: string;
+    body: string | null;
+    body_commitment: string;
+  }>;
+}): Promise<{
+  view: DocView;
+  costUsd: number;
+  tokensUsed: number;
+  generationSeconds: number;
+  pipeline: "v1" | "v2";
+  model?: string;
+}> {
+  if (useV2()) {
+    try {
+      const r = await buildDocV2({
+        slug: args.slug,
+        description: args.description,
+        entries: args.v2Entries,
+      });
+      console.log(
+        `[views.doc ${args.slug}] v2 ok in ${r.generationSeconds.toFixed(1)}s, ` +
+          `$${r.costUsd.toFixed(4)}, ${r.cacheHits} cache hits / ${r.cacheMisses} fresh sections`,
+      );
+      return {
+        view: r.view,
+        costUsd: r.costUsd,
+        tokensUsed: r.tokensUsed,
+        generationSeconds: r.generationSeconds,
+        pipeline: "v2",
+      };
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        // Don't quietly fall back on budget exceeded — surface to caller.
+        throw err;
+      }
+      console.error(
+        `[views.doc ${args.slug}] v2 failed; falling back to v1:`,
+        err,
+      );
+      // fall through to v1
+    }
+  }
+  const r = await buildDocView({
+    slug: args.slug,
+    prompt: args.v1Prompt,
+    entries: args.v1Entries,
+  });
+  return {
+    view: r.view,
+    costUsd: r.costUsd,
+    tokensUsed: r.tokensUsed,
+    generationSeconds: r.generationSeconds,
+    pipeline: "v1",
+    model: r.model,
+  };
 }
 
 /** Background regeneration with a Redis SETNX lock so that 50 visitors
  *  hitting the same stale page only fire ONE LLM call between them. The
- *  lock auto-expires after 90s (longer than the LLM timeout) in case a
+ *  lock auto-expires after 120s (longer than the LLM timeout) in case a
  *  generation crashes mid-flight. */
 function backgroundRegenerate(
   slug: string,
   description: string,
   pHash: string,
-  prompt: string,
+  v1Prompt: string,
   targetHeadHash: string,
 ): void {
   void (async () => {
     const lockKey = `docview-regen:${slug}:${pHash}:${targetHeadHash}`;
     try {
-      const got = await redis.set(lockKey, "1", "EX", 90, "NX");
+      const got = await redis.set(lockKey, "1", "EX", 120, "NX");
       if (got !== "OK") return;
 
       const pageRows = await pool.query<{ head_hash: string }>(
@@ -99,7 +213,24 @@ function backgroundRegenerate(
       if (exists.rows.length > 0) return;
 
       const entries = await fetchEntries(slug);
-      const result = await buildDocView({ slug, prompt, entries });
+      const result = await buildDocOrFallback({
+        slug,
+        description,
+        v1Prompt,
+        v1Entries: entries.map((e) => ({
+          seq: e.seq,
+          kind: e.kind,
+          parent_seq: e.parent_seq,
+          body: e.body,
+        })),
+        v2Entries: entries.map((e) => ({
+          id: e.id,
+          seq: e.seq,
+          kind: e.kind,
+          body: e.body,
+          body_commitment: e.body_commitment,
+        })),
+      });
       await pool.query(
         `INSERT INTO view_cache
            (page_slug, view_prompt_hash, head_hash, view_json, tokens_used, cost_usd)
@@ -115,7 +246,7 @@ function backgroundRegenerate(
         ],
       );
       console.log(
-        `[views.doc ${slug}] background regen ok in ${result.generationSeconds.toFixed(
+        `[views.doc ${slug}] background regen ok (${result.pipeline}) in ${result.generationSeconds.toFixed(
           1,
         )}s, $${result.costUsd.toFixed(4)}`,
       );
@@ -129,27 +260,26 @@ function backgroundRegenerate(
   })();
 }
 
-async function fetchEntries(slug: string): Promise<
-  Array<{
-    seq: number;
-    kind: string;
-    parent_seq: number | null;
-    body: string | null;
-  }>
-> {
+async function fetchEntries(slug: string): Promise<EntryRow[]> {
   // Pass parent_seq (not parent_id) to the LLM since it works in seqs.
   // Erased entries (body NULL or erased_at NOT NULL) are filtered out
   // server-side: they have no body to synthesize, and including them
   // would just inflate prompt tokens AND cause the LLM to list every
   // erased entry as "off-topic" by default. Citations stay correct
   // because the LLM only ever sees seqs that have real bodies.
+  //
+  // body_commitment is included so v2 can hash it into members_hash for
+  // section-level cache invalidation (a body change doesn't typically
+  // happen post-commit, but if it ever does — via erasure-then-restore
+  // or schema migration — the cache invalidates cleanly).
   const rows = await pool.query<EntryRow>(
     `SELECT
        e.id,
        e.seq,
        e.kind,
        p.seq AS parent_seq,
-       b.body
+       b.body,
+       e.body_commitment
      FROM entries e
      LEFT JOIN entries p ON p.id = e.parent_id
      LEFT JOIN entry_bodies b ON b.entry_id = e.id
@@ -161,10 +291,12 @@ async function fetchEntries(slug: string): Promise<
     [slug],
   );
   return rows.rows.map((r) => ({
+    id: r.id,
     seq: r.seq,
     kind: r.kind,
     parent_seq: r.parent_seq,
     body: r.body,
+    body_commitment: r.body_commitment,
   }));
 }
 
@@ -202,8 +334,9 @@ export async function GET(
     return new NextResponse(null, { status: 204 });
   }
 
-  const prompt = docPromptFor(slug, page.description);
-  const pHash = docPromptHash(prompt);
+  // Pipeline-aware cache key.
+  const v1Prompt = docPromptFor(slug, page.description);
+  const pHash = useV2() ? v2PromptHash() : docPromptHash(v1Prompt);
 
   // The seq->id map is needed for any 200 response; do it once.
   const seqToIdPromise = fetchSeqToId(slug);
@@ -260,7 +393,7 @@ export async function GET(
       );
       const entriesSince = parseInt(since.rows[0]?.delta ?? "0", 10);
 
-      backgroundRegenerate(slug, page.description, pHash, prompt, page.head_hash);
+      backgroundRegenerate(slug, page.description, pHash, v1Prompt, page.head_hash);
 
       const entry_seq_to_id = await seqToIdPromise;
       return NextResponse.json(
@@ -296,7 +429,24 @@ export async function GET(
   const entries = await fetchEntries(slug);
   let result;
   try {
-    result = await buildDocView({ slug, prompt, entries });
+    result = await buildDocOrFallback({
+      slug,
+      description: page.description,
+      v1Prompt,
+      v1Entries: entries.map((e) => ({
+        seq: e.seq,
+        kind: e.kind,
+        parent_seq: e.parent_seq,
+        body: e.body,
+      })),
+      v2Entries: entries.map((e) => ({
+        id: e.id,
+        seq: e.seq,
+        kind: e.kind,
+        body: e.body,
+        body_commitment: e.body_commitment,
+      })),
+    });
   } catch (err) {
     if (err instanceof BudgetExceededError) {
       return NextResponse.json(
@@ -342,6 +492,7 @@ export async function GET(
       generated_at: new Date().toISOString(),
       model: result.model,
       generation_seconds: result.generationSeconds,
+      pipeline: result.pipeline,
       entry_seq_to_id,
     },
     {

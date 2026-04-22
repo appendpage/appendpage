@@ -22,21 +22,14 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 import { pool } from "@/lib/db";
-import { redis } from "@/lib/redis";
 import { BudgetExceededError } from "@/lib/llm";
 import {
-  extractTagsBatch,
-  TAG_PROMPT_VERSION,
+  backgroundExtract,
+  extractWithCache,
   type PerEntryMetadata,
 } from "@/lib/tags";
 
 export const dynamic = "force-dynamic";
-
-const TAGS_MODEL =
-  process.env.OPENAI_TAGS_MODEL ?? "gpt-5.4-nano-2026-03-17";
-
-const MAX_BATCH_SIZE = 50;
-const MAX_BODY_BYTES_PER_BATCH = 60_000;
 
 interface CandidateRow {
   id: string;
@@ -174,122 +167,5 @@ function emptyResponse() {
   };
 }
 
-/** Persist a batch of (entry_id -> meta) rows into entry_tags. Idempotent. */
-async function persistMeta(
-  meta: Map<string, PerEntryMetadata>,
-  costPerEntry: number,
-): Promise<void> {
-  if (meta.size === 0) return;
-  const values: unknown[] = [];
-  const tuples: string[] = [];
-  let i = 1;
-  for (const [id, m] of meta) {
-    tuples.push(
-      `($${i}, $${i + 1}, $${i + 2}::jsonb, $${i + 3}, $${i + 4}, $${i + 5}, $${i + 6}, $${i + 7})`,
-    );
-    values.push(
-      id,
-      m.subject,
-      JSON.stringify(m.tags),
-      m.relevant,
-      m.relevance_reason,
-      TAGS_MODEL,
-      TAG_PROMPT_VERSION,
-      costPerEntry.toFixed(6),
-    );
-    i += 8;
-  }
-  await pool.query(
-    `INSERT INTO entry_tags
-       (entry_id, subject, tags, relevant, relevance_reason,
-        model, prompt_version, cost_usd)
-     VALUES ${tuples.join(", ")}
-     ON CONFLICT (entry_id) DO NOTHING`,
-    values,
-  );
-}
-
-/** Extract + persist in one shot. Used for both inline and background paths. */
-async function extractWithCache(
-  slug: string,
-  description: string,
-  uncached: Array<{ id: string; body: string }>,
-): Promise<Map<string, PerEntryMetadata>> {
-  const merged = new Map<string, PerEntryMetadata>();
-  for (const batch of chunkByBytes(
-    uncached,
-    MAX_BATCH_SIZE,
-    MAX_BODY_BYTES_PER_BATCH,
-  )) {
-    const result = await extractTagsBatch(batch, { slug, description });
-    const perEntry =
-      batch.length > 0 ? result.costUsd / batch.length : 0;
-    await persistMeta(result.meta, perEntry);
-    for (const [id, m] of result.meta) merged.set(id, m);
-    console.log(
-      `[tags ${slug}] extracted ${result.meta.size}/${batch.length} entries, $${result.costUsd.toFixed(4)}, ${result.generationSeconds.toFixed(1)}s`,
-    );
-  }
-  return merged;
-}
-
-/**
- * Chunk an array of entries into batches whose total body bytes stay
- * under maxBytes (so a few very long entries don't wedge a 50-entry batch).
- */
-function chunkByBytes<T extends { body: string }>(
-  arr: T[],
-  maxItems: number,
-  maxBytes: number,
-): T[][] {
-  const out: T[][] = [];
-  let cur: T[] = [];
-  let curBytes = 0;
-  for (const item of arr) {
-    const b = Buffer.byteLength(item.body, "utf8");
-    if (
-      cur.length > 0 &&
-      (cur.length >= maxItems || curBytes + b > maxBytes)
-    ) {
-      out.push(cur);
-      cur = [];
-      curBytes = 0;
-    }
-    cur.push(item);
-    curBytes += b;
-  }
-  if (cur.length > 0) out.push(cur);
-  return out;
-}
-
-/**
- * Fire-and-forget background extraction. Same Redis lock pattern as the
- * AI-view background regen.
- */
-function backgroundExtract(
-  slug: string,
-  description: string,
-  uncached: Array<{ id: string; body: string }>,
-): void {
-  void (async () => {
-    const lockKey = `tags-extract:${slug}`;
-    try {
-      const got = await redis.set(lockKey, "1", "EX", 120, "NX");
-      if (got !== "OK") return; // another worker is on it
-      await extractWithCache(slug, description, uncached);
-    } catch (err) {
-      if (err instanceof BudgetExceededError) {
-        console.warn(`[tags ${slug}] bg extract skipped: budget cap`);
-      } else {
-        console.error(`[tags ${slug}] bg extract failed:`, err);
-      }
-    } finally {
-      // Release lock early so next request after we finish can pick up new entries.
-      try {
-        await redis.del(lockKey);
-      } catch {
-        /* ignore */
-      }
-    }
-  })();
-}
+// Helpers (extractWithCache, backgroundExtract, persistMeta, chunkByBytes)
+// live in lib/tags.ts so docview-v2 can share them.

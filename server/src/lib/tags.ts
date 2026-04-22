@@ -23,11 +23,13 @@
 import { z } from "zod";
 
 import { commitOverage, reserveBudget } from "./budget";
+import { pool } from "./db";
 import { BudgetExceededError } from "./llm";
+import { redis } from "./redis";
 
 export const TAG_PROMPT_VERSION = "v2.2026.04.21";
 
-const TAGS_MODEL =
+export const TAGS_MODEL =
   process.env.OPENAI_TAGS_MODEL ?? "gpt-5.4-nano-2026-03-17";
 
 const SYSTEM_PROMPT = `You organize anonymous user-posted entries on the page "/p/{slug}".
@@ -246,4 +248,188 @@ function cleanSubject(raw: string | null | undefined): string | null {
   if (s.length > 80) s = s.slice(0, 80).trim();
   if (s.length < 2) return null;
   return s;
+}
+
+// ---------- shared cache + batch helpers (used by /tags route AND docview-v2) ----------
+
+/**
+ * Persist a batch of (entry_id -> meta) rows into entry_tags. Idempotent
+ * (`ON CONFLICT (entry_id) DO NOTHING`).
+ */
+export async function persistMeta(
+  meta: Map<string, PerEntryMetadata>,
+  costPerEntry: number,
+): Promise<void> {
+  if (meta.size === 0) return;
+  const values: unknown[] = [];
+  const tuples: string[] = [];
+  let i = 1;
+  for (const [id, m] of meta) {
+    tuples.push(
+      `($${i}, $${i + 1}, $${i + 2}::jsonb, $${i + 3}, $${i + 4}, $${i + 5}, $${i + 6}, $${i + 7})`,
+    );
+    values.push(
+      id,
+      m.subject,
+      JSON.stringify(m.tags),
+      m.relevant,
+      m.relevance_reason,
+      TAGS_MODEL,
+      TAG_PROMPT_VERSION,
+      costPerEntry.toFixed(6),
+    );
+    i += 8;
+  }
+  await pool.query(
+    `INSERT INTO entry_tags
+       (entry_id, subject, tags, relevant, relevance_reason,
+        model, prompt_version, cost_usd)
+     VALUES ${tuples.join(", ")}
+     ON CONFLICT (entry_id) DO NOTHING`,
+    values,
+  );
+}
+
+/**
+ * Chunk an array of entries into batches whose total body bytes stay
+ * under maxBytes (so a few very long entries don't wedge a 50-entry batch).
+ */
+export function chunkByBytes<T extends { body: string }>(
+  arr: T[],
+  maxItems: number,
+  maxBytes: number,
+): T[][] {
+  const out: T[][] = [];
+  let cur: T[] = [];
+  let curBytes = 0;
+  for (const item of arr) {
+    const b = Buffer.byteLength(item.body, "utf8");
+    if (
+      cur.length > 0 &&
+      (cur.length >= maxItems || curBytes + b > maxBytes)
+    ) {
+      out.push(cur);
+      cur = [];
+      curBytes = 0;
+    }
+    cur.push(item);
+    curBytes += b;
+  }
+  if (cur.length > 0) out.push(cur);
+  return out;
+}
+
+/**
+ * Default batch shape — 50 entries OR 60 KB of body content per batch,
+ * whichever cap is hit first. The /tags route + docview-v2 share this.
+ */
+export const TAGS_MAX_BATCH_SIZE = 50;
+export const TAGS_MAX_BODY_BYTES_PER_BATCH = 60_000;
+
+/**
+ * Extract tags for a list of uncached entries, persist into entry_tags,
+ * and return the resulting metadata map. Used by the /tags route AND by
+ * docview-v2's `ensureTagged` precondition. Idempotent.
+ */
+export async function extractWithCache(
+  slug: string,
+  description: string,
+  uncached: Array<{ id: string; body: string }>,
+): Promise<Map<string, PerEntryMetadata>> {
+  const merged = new Map<string, PerEntryMetadata>();
+  for (const batch of chunkByBytes(
+    uncached,
+    TAGS_MAX_BATCH_SIZE,
+    TAGS_MAX_BODY_BYTES_PER_BATCH,
+  )) {
+    const result = await extractTagsBatch(batch, { slug, description });
+    const perEntry = batch.length > 0 ? result.costUsd / batch.length : 0;
+    await persistMeta(result.meta, perEntry);
+    for (const [id, m] of result.meta) merged.set(id, m);
+    console.log(
+      `[tags ${slug}] extracted ${result.meta.size}/${batch.length} entries, $${result.costUsd.toFixed(4)}, ${result.generationSeconds.toFixed(1)}s`,
+    );
+  }
+  return merged;
+}
+
+/**
+ * Fire-and-forget background extraction. Same Redis lock pattern as the
+ * AI-view background regen, scoped per-slug so 50 simultaneous visitors
+ * to a stale page only fire one extraction.
+ */
+export function backgroundExtract(
+  slug: string,
+  description: string,
+  uncached: Array<{ id: string; body: string }>,
+): void {
+  void (async () => {
+    const lockKey = `tags-extract:${slug}`;
+    try {
+      const got = await redis.set(lockKey, "1", "EX", 120, "NX");
+      if (got !== "OK") return; // another worker is on it
+      await extractWithCache(slug, description, uncached);
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        console.warn(`[tags ${slug}] bg extract skipped: budget cap`);
+      } else {
+        console.error(`[tags ${slug}] bg extract failed:`, err);
+      }
+    } finally {
+      // Release lock early so next request after we finish can pick up new entries.
+      try {
+        await redis.del(lockKey);
+      } catch {
+        /* ignore */
+      }
+    }
+  })();
+}
+
+/**
+ * Precondition for docview-v2: ensure every (id, body) in `entries` has a
+ * row in entry_tags. Synchronous (caller blocks until done) — use only when
+ * the result is needed inline. For the SWR/background path, callers should
+ * use `backgroundExtract` instead and tolerate stale tags.
+ *
+ * Returns the full metadata map (cached + freshly-extracted).
+ */
+export async function ensureTagged(
+  slug: string,
+  description: string,
+  entries: Array<{ id: string; body: string | null }>,
+): Promise<Map<string, PerEntryMetadata>> {
+  const ids = entries.map((e) => e.id);
+  if (ids.length === 0) return new Map();
+
+  const existing = await pool.query<{
+    entry_id: string;
+    subject: string | null;
+    tags: string[] | null;
+    relevant: boolean;
+    relevance_reason: string | null;
+  }>(
+    `SELECT entry_id, subject, tags, relevant, relevance_reason
+       FROM entry_tags
+      WHERE entry_id = ANY($1::text[])`,
+    [ids],
+  );
+  const have = new Map<string, PerEntryMetadata>();
+  for (const r of existing.rows) {
+    have.set(r.entry_id, {
+      subject: r.subject,
+      tags: Array.isArray(r.tags) ? r.tags : [],
+      relevant: r.relevant,
+      relevance_reason: r.relevance_reason,
+    });
+  }
+
+  const need = entries.filter(
+    (e) => e.body !== null && !have.has(e.id),
+  ) as Array<{ id: string; body: string }>;
+  if (need.length === 0) return have;
+
+  const fresh = await extractWithCache(slug, description, need);
+  for (const [id, m] of fresh) have.set(id, m);
+  return have;
 }
