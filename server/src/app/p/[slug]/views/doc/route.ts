@@ -311,6 +311,28 @@ async function fetchSeqToId(slug: string): Promise<Record<string, string>> {
   return out;
 }
 
+/**
+ * Truncate a DocView's sections array to the top K, preserving the
+ * total_sections metadata so the frontend knows there's more. Sections
+ * are assumed already ordered by importance (member-count desc) by
+ * docview-v2.planClusters. v1 docs are returned unchanged when
+ * truncation would do nothing useful (no member_seqs metadata).
+ */
+function truncateSections(view: DocView, maxSections: number): DocView {
+  if (
+    view.sections.length <= maxSections ||
+    !Number.isFinite(maxSections) ||
+    maxSections <= 0
+  ) {
+    return view;
+  }
+  return {
+    ...view,
+    sections: view.sections.slice(0, maxSections),
+    total_sections: view.total_sections ?? view.sections.length,
+  };
+}
+
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ slug: string }> },
@@ -320,6 +342,14 @@ export async function GET(
   const cacheOnly = searchParams.get("cache_only") === "1";
   const noCache = searchParams.get("nocache") === "1";
   const staleOk = searchParams.get("stale_ok") === "1";
+  // Phase 2 pagination: ?max_sections=K returns only the top-K sections
+  // by member-post count. The server still caches the FULL doc; this is
+  // a per-response trim. K=0 / unset means "all sections" (current
+  // behavior, full backwards-compat).
+  const maxSectionsParam = searchParams.get("max_sections");
+  const maxSections = maxSectionsParam
+    ? Math.max(1, Math.min(40, parseInt(maxSectionsParam, 10) || 40))
+    : Infinity;
 
   const pageRows = await pool.query<PageRow>(
     "SELECT slug, description, head_hash, head_seq, status FROM pages WHERE slug = $1",
@@ -354,7 +384,7 @@ export async function GET(
       const entry_seq_to_id = await seqToIdPromise;
       return NextResponse.json(
         {
-          view: r.view_json,
+          view: truncateSections(r.view_json, maxSections),
           head_hash: page.head_hash,
           cached: true,
           stale: false,
@@ -398,7 +428,7 @@ export async function GET(
       const entry_seq_to_id = await seqToIdPromise;
       return NextResponse.json(
         {
-          view: r.view_json,
+          view: truncateSections(r.view_json, maxSections),
           head_hash: page.head_hash,
           cache_head_hash: r.head_hash,
           cached: true,
@@ -485,7 +515,7 @@ export async function GET(
   const entry_seq_to_id = await seqToIdPromise;
   return NextResponse.json(
     {
-      view: result.view,
+      view: truncateSections(result.view, maxSections),
       head_hash: page.head_hash,
       cached: false,
       cost_usd: result.costUsd,

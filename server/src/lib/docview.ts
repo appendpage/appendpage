@@ -39,6 +39,16 @@ const CitesArray = z.array(z.number().int().nonnegative()).max(20);
  *   - section.summary: 1200 -> 3000 (full paragraph for 6+ post sections)
  *   - section.key_points[].text: 280 -> 600 (1-3 sentences per point)
  * v2 also drops `conflicting_views` (per-section coverage absorbed it).
+ *
+ * v2.1 (Phase 2 pagination): adds optional metadata fields populated by
+ * docview-v2 but invisible to the LLM (they're set after synthesis):
+ *   - total_sections: number of sections in the FULL doc (used by the
+ *     server when truncating to ?max_sections=K).
+ *   - section.member_seqs: the entry seqs that belong to this section.
+ *   - section.total_key_points: how many key_points the section has in
+ *     the full uncapped doc, even if the response truncates the array.
+ * Old payloads (v1, v2 pre-Phase-2) stay schema-valid because all new
+ * fields are optional.
  */
 export const DocViewSchema = z.object({
   /** ~10-15 word title summarizing what this page actually contains. */
@@ -61,11 +71,20 @@ export const DocViewSchema = z.object({
             }),
           )
           .max(20),
+        /** v2.1: entry seqs that belong to this section. Populated by
+         *  docview-v2 from the cluster's member set. */
+        member_seqs: z.array(z.number().int().nonnegative()).optional(),
+        /** v2.1: total key_points in the unpaginated section. Equal to
+         *  key_points.length unless the response truncated. */
+        total_key_points: z.number().int().nonnegative().optional(),
       }),
     )
     .max(40),
   /** Entry seqs that didn't fit anywhere — jokes, spam, totally unrelated. */
   off_topic_seqs: z.array(z.number().int().nonnegative()).max(500),
+  /** v2.1: total sections in the unpaginated doc. Equal to
+   *  sections.length unless the response truncated to ?max_sections=K. */
+  total_sections: z.number().int().nonnegative().optional(),
 });
 export type DocView = z.infer<typeof DocViewSchema>;
 

@@ -684,9 +684,25 @@ function planClusters(
     }
   }
 
-  const clusters = [...bySubject.values()].sort(
-    (a, b) => b.member_count - a.member_count || a.subject.localeCompare(b.subject),
-  );
+  // Default ordering: alphabetical by subject heading. This is a
+  // **stability** choice for the user experience: returning visitors
+  // find the section about the same person/place in the same position
+  // every time, even after new posts arrive. Recency is surfaced
+  // separately on the frontend (a "Recently active" callout right
+  // after the intro + per-section "new" badges), so we don't need to
+  // sacrifice structural stability to convey activity.
+  //
+  // Tiebreaker for case-equivalent or display-identical subjects falls
+  // through to member_count desc, then to the raw subject string.
+  // Uncategorized always goes last regardless of name.
+  const clusters = [...bySubject.values()].sort((a, b) => {
+    const cmp = a.subject.localeCompare(b.subject, undefined, {
+      sensitivity: "base",
+      numeric: true,
+    });
+    if (cmp !== 0) return cmp;
+    return b.member_count - a.member_count;
+  });
   if (uncategorized.length > 0) {
     clusters.push({
       subject: UNCATEGORIZED_SUBJECT,
@@ -868,7 +884,9 @@ export async function buildDocV2(
     }
   }
 
-  // 5. Compose final DocView (shape-compatible with v1).
+  // 5. Compose final DocView (shape-compatible with v1; Phase 2 adds the
+  //    member_seqs / total_key_points / total_sections metadata so the
+  //    frontend can paginate without re-fetching).
   const view: DocView = {
     title,
     intro,
@@ -876,8 +894,11 @@ export async function buildDocV2(
       heading: s.heading,
       summary: s.summary,
       key_points: s.key_points,
+      member_seqs: s.member_seqs,
+      total_key_points: s.key_points.length,
     })),
     off_topic_seqs: offTopicSeqs,
+    total_sections: sections.length,
   };
 
   return {
