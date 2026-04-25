@@ -42,6 +42,7 @@ import { commitOverage, reserveBudget } from "./budget";
 import { pool } from "./db";
 import { type DocView } from "./docview";
 import { BudgetExceededError } from "./llm";
+import { dedupeSubjects } from "./subject-dedup";
 import { ensureTagged, type PerEntryMetadata } from "./tags";
 
 // ---------- prompts ----------
@@ -802,6 +803,59 @@ export async function buildDocV2(
           relevant: r.relevant,
           relevance_reason: r.relevance_reason,
         });
+      }
+    }
+  }
+
+  // 1b. Subject deduplication. Per-batch tag extraction can produce slightly
+  //     different subject strings for the same real-world entity (e.g.
+  //     "Rutgers · Yingying Chen" vs "Rutgers ECE · Yingying Chen"). One
+  //     focused LLM call collapses those to a canonical form. Cached per
+  //     (page, sorted-subject-set hash), so repeat visits never re-pay and
+  //     a brand-new subject naturally invalidates the alias map.
+  //
+  //     Failure-safe: any error (budget cap, parse, network) falls back to
+  //     identity (no merging) so the page still renders. Dedup is a
+  //     refinement, not a correctness requirement.
+  const uniqueSubjects = Array.from(
+    new Set(
+      Array.from(meta.values())
+        .map((m) => m.subject)
+        .filter((s): s is string => typeof s === "string" && s.length > 0),
+    ),
+  );
+  if (uniqueSubjects.length >= 2) {
+    try {
+      const dedup = await dedupeSubjects(
+        args.slug,
+        args.description,
+        uniqueSubjects,
+      );
+      totalCost += dedup.costUsd;
+      totalTokens += dedup.tokensUsed;
+      if (dedup.aliasMap.size > 0) {
+        for (const [id, m] of meta) {
+          if (m.subject) {
+            const canon = dedup.aliasMap.get(m.subject);
+            if (canon && canon !== m.subject) {
+              meta.set(id, { ...m, subject: canon });
+            }
+          }
+        }
+        console.log(
+          `[docview-v2 ${args.slug}] subject-dedup merged ${dedup.aliasMap.size} aliases (${dedup.cached ? "cache hit" : `$${dedup.costUsd.toFixed(4)}, ${dedup.generationSeconds.toFixed(1)}s`})`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        console.warn(
+          `[docview-v2 ${args.slug}] subject-dedup skipped: budget cap`,
+        );
+      } else {
+        console.error(
+          `[docview-v2 ${args.slug}] subject-dedup failed (rendering without merge):`,
+          err,
+        );
       }
     }
   }
