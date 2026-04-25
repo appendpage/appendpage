@@ -26,6 +26,7 @@ import { BudgetExceededError } from "@/lib/llm";
 import {
   backgroundExtract,
   extractWithCache,
+  TAG_PROMPT_VERSION,
   type PerEntryMetadata,
 } from "@/lib/tags";
 
@@ -33,7 +34,10 @@ export const dynamic = "force-dynamic";
 
 interface CandidateRow {
   id: string;
+  seq: number;
   body: string | null;
+  parent_id: string | null;
+  parent_body: string | null;
   subject: string | null;
   tags: string[] | null;
   relevant: boolean | null; // null if uncached (left join)
@@ -66,23 +70,39 @@ export async function GET(
     return NextResponse.json(emptyResponse(), { status: 200 });
   }
 
+  // Fetch each candidate's body, parent body (if it's a reply), and any
+  // existing entry_tags row. The parent_body LEFT JOIN respects
+  // erased_at so an erased parent contributes null instead of stale
+  // bodies. The entry_tags JOIN is filtered to current TAG_PROMPT_VERSION
+  // — rows from older prompt versions are treated as missing so a
+  // bump (e.g. v2 -> v3 reply-aware) re-extracts naturally.
   const candidatesQ = await pool.query<CandidateRow>(
-    `SELECT e.id, b.body,
+    `SELECT e.id, e.seq, b.body,
+            e.parent_id, pb.body AS parent_body,
             t.subject, t.tags, t.relevant, t.relevance_reason
        FROM entries e
-       LEFT JOIN entry_bodies b ON b.entry_id = e.id
-       LEFT JOIN entry_tags   t ON t.entry_id = e.id
+       LEFT JOIN entry_bodies b  ON b.entry_id  = e.id
+       LEFT JOIN entry_bodies pb ON pb.entry_id = e.parent_id
+                                    AND pb.erased_at IS NULL
+       LEFT JOIN entry_tags   t  ON t.entry_id  = e.id
+                                    AND t.prompt_version = $2
       WHERE e.page_slug = $1 AND e.kind = 'entry'
       ORDER BY e.seq ASC`,
-    [slug],
+    [slug, TAG_PROMPT_VERSION],
   );
   const all = candidatesQ.rows;
 
   const cachedMeta = new Map<string, PerEntryMetadata>();
-  const uncached: Array<{ id: string; body: string }> = [];
+  const uncached: Array<{
+    id: string;
+    seq: number;
+    body: string;
+    parent_id: string | null;
+    parent_body: string | null;
+  }> = [];
   for (const r of all) {
     if (r.relevant !== null) {
-      // Has a row in entry_tags
+      // Has a current-version row in entry_tags.
       cachedMeta.set(r.id, {
         subject: r.subject,
         tags: Array.isArray(r.tags) ? r.tags : [],
@@ -90,16 +110,27 @@ export async function GET(
         relevance_reason: r.relevance_reason,
       });
     } else if (r.body) {
-      uncached.push({ id: r.id, body: r.body });
+      uncached.push({
+        id: r.id,
+        seq: r.seq,
+        body: r.body,
+        parent_id: r.parent_id,
+        parent_body: r.parent_body,
+      });
     }
   }
 
   if (uncached.length > 0) {
     if (staleOk) {
-      backgroundExtract(slug, page.description, uncached);
+      backgroundExtract(slug, page.description, uncached, cachedMeta);
     } else {
       try {
-        const newMeta = await extractWithCache(slug, page.description, uncached);
+        const newMeta = await extractWithCache(
+          slug,
+          page.description,
+          uncached,
+          cachedMeta,
+        );
         for (const [id, m] of newMeta) cachedMeta.set(id, m);
       } catch (err) {
         if (err instanceof BudgetExceededError) {

@@ -719,11 +719,15 @@ function planClusters(
 export interface BuildDocV2Args {
   slug: string;
   description: string;
-  /** All chain entries (we'll filter out erased ones internally). */
+  /** All chain entries (we'll filter out erased ones internally).
+   *  parent_id + parent_body are passed through to the v3+ tagger so a
+   *  reply that doesn't name its subject inherits the parent's. */
   entries: Array<{
     id: string;
     seq: number;
     kind: string;
+    parent_id: string | null;
+    parent_body: string | null;
     body: string | null;
     body_commitment: string;
   }>;
@@ -759,10 +763,18 @@ export async function buildDocV2(
   let cacheHits = 0;
   let cacheMisses = 0;
 
-  // 1. Ensure tags.
+  // 1. Ensure tags. Reply context (parent_id + parent_body) flows
+  //    through to ensureTagged so v3+ extraction can inherit subject
+  //    from the parent thread when a reply doesn't name its own.
   const tagInput = args.entries
     .filter((e) => e.kind === "entry") // skip moderation entries from synthesis
-    .map((e) => ({ id: e.id, body: e.body }));
+    .map((e) => ({
+      id: e.id,
+      seq: e.seq,
+      body: e.body,
+      parent_id: e.parent_id,
+      parent_body: e.parent_body,
+    }));
   const meta = args.skipUntaggedExtraction
     ? new Map<string, PerEntryMetadata>()
     : await ensureTagged(args.slug, args.description, tagInput);

@@ -83,7 +83,9 @@ interface EntryRow {
   id: string;
   seq: number;
   kind: string;
+  parent_id: string | null;
   parent_seq: number | null;
+  parent_body: string | null;
   body: string | null;
   body_commitment: string;
 }
@@ -123,6 +125,8 @@ async function buildDocOrFallback(args: {
     id: string;
     seq: number;
     kind: string;
+    parent_id: string | null;
+    parent_body: string | null;
     body: string | null;
     body_commitment: string;
   }>;
@@ -227,6 +231,8 @@ function backgroundRegenerate(
           id: e.id,
           seq: e.seq,
           kind: e.kind,
+          parent_id: e.parent_id,
+          parent_body: e.parent_body,
           body: e.body,
           body_commitment: e.body_commitment,
         })),
@@ -282,12 +288,16 @@ async function fetchEntries(slug: string): Promise<EntryRow[]> {
        e.id,
        e.seq,
        e.kind,
-       p.seq AS parent_seq,
+       e.parent_id,
+       p.seq  AS parent_seq,
+       pb.body AS parent_body,
        b.body,
        e.body_commitment
      FROM entries e
-     LEFT JOIN entries p ON p.id = e.parent_id
-     LEFT JOIN entry_bodies b ON b.entry_id = e.id
+     LEFT JOIN entries      p  ON p.id        = e.parent_id
+     LEFT JOIN entry_bodies pb ON pb.entry_id = e.parent_id
+                                  AND pb.erased_at IS NULL
+     LEFT JOIN entry_bodies b  ON b.entry_id  = e.id
      WHERE e.page_slug = $1
        AND b.body IS NOT NULL
        AND b.erased_at IS NULL
@@ -299,7 +309,9 @@ async function fetchEntries(slug: string): Promise<EntryRow[]> {
     id: r.id,
     seq: r.seq,
     kind: r.kind,
+    parent_id: r.parent_id,
     parent_seq: r.parent_seq,
+    parent_body: r.parent_body,
     body: r.body,
     body_commitment: r.body_commitment,
   }));
@@ -478,6 +490,8 @@ export async function GET(
         id: e.id,
         seq: e.seq,
         kind: e.kind,
+        parent_id: e.parent_id,
+        parent_body: e.parent_body,
         body: e.body,
         body_commitment: e.body_commitment,
       })),
