@@ -9,8 +9,9 @@ Other modes:
     python verify.py path/to/page.jsonl                       # chain only, offline
     curl -sS https://append.page/p/<slug>/raw | \\
         python verify.py /dev/stdin                           # chain only, offline
-    python verify.py path/to/page.jsonl \\
-        --with-bodies path/to/bodies.json                     # chain + bodies, offline
+
+    # After unzipping https://append.page/p/<slug>/archive.zip:
+    python verify.py chain.jsonl --with-bodies bodies.jsonl   # chain + bodies, offline
 
 Exit codes:
     0  chain (and optionally bodies) intact
@@ -197,6 +198,56 @@ def fetch_url(base_url: str) -> tuple[list[dict], dict[str, dict]]:
     return entries, bodies_by_id
 
 
+def _load_bodies_file(path: str) -> dict[str, dict]:
+    """
+    Read a --with-bodies file. Auto-detect JSONL (one {entry_id, body, salt}
+    object per line; what /p/<slug>/bodies.jsonl serves and what's bundled
+    inside /p/<slug>/archive.zip) vs the legacy JSON shape (a single object
+    mapping entry_id -> {body, salt}).
+
+    Detection: read the first non-blank line; if it parses to an object
+    that has an "entry_id" key, treat the whole file as JSONL. Otherwise
+    fall back to json.load on the whole file.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    first_nonblank: Optional[str] = None
+    for line in text.splitlines():
+        if line.strip():
+            first_nonblank = line
+            break
+
+    if first_nonblank is not None:
+        try:
+            probe = json.loads(first_nonblank)
+        except json.JSONDecodeError:
+            probe = None
+        if isinstance(probe, dict) and "entry_id" in probe:
+            # JSONL — one object per line.
+            out: dict[str, dict] = {}
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                entry_id = row.get("entry_id")
+                if not entry_id:
+                    continue
+                if row.get("erased"):
+                    # Erased entries have body=None; skip — chain check
+                    # still applies to them, body check has nothing to do.
+                    continue
+                body = row.get("body")
+                salt = row.get("salt")
+                if body is None or salt is None:
+                    continue
+                out[entry_id] = {"body": body, "salt": salt}
+            return out
+
+    # Fallback: legacy JSON object {entry_id: {body, salt}}.
+    return json.loads(text)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Verify an append.page chain (and optionally bodies)."
@@ -213,7 +264,13 @@ def main() -> int:
         "--with-bodies",
         metavar="PATH",
         help=(
-            "JSON file mapping entry_id -> {body, salt} (salt as hex). "
+            "Path to bodies file. Two formats are accepted, auto-detected:\n"
+            "  (1) JSONL — one object per line, "
+            '{"entry_id": "...", "body": "...", "salt": "..."} '
+            "(this is the format /p/<slug>/bodies.jsonl serves and the "
+            "format bundled inside /p/<slug>/archive.zip).\n"
+            "  (2) JSON — a single object mapping entry_id -> "
+            "{body, salt} (the legacy hand-assembled shape).\n"
             "Ignored when SOURCE is a URL — bodies are fetched live in "
             "that case."
         ),
@@ -243,8 +300,7 @@ def main() -> int:
         with open(args.source, "r", encoding="utf-8") as f:
             entries = [json.loads(line) for line in f if line.strip()]
         if args.with_bodies:
-            with open(args.with_bodies, "r", encoding="utf-8") as f:
-                bodies_by_id = json.load(f)
+            bodies_by_id = _load_bodies_file(args.with_bodies)
 
     ok, msg = verify_chain(entries, bodies_by_id)
     if not ok:

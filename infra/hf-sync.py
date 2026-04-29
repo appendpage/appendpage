@@ -93,6 +93,21 @@ def fetch_page_jsonl(slug: str) -> bytes:
         raise RuntimeError(f"GET /p/{slug}/raw: {e.code} {e.reason}") from e
 
 
+def fetch_page_bodies_jsonl(slug: str) -> bytes:
+    """GET /p/<slug>/bodies.jsonl from the local backend. Returns raw bytes."""
+    req = urllib.request.Request(
+        f"{API_URL}/p/{slug}/bodies.jsonl",
+        headers={"accept": "application/x-ndjson"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"GET /p/{slug}/bodies.jsonl: {e.code} {e.reason}"
+        ) from e
+
+
 README_TEMPLATE = """\
 ---
 license: mit
@@ -108,20 +123,34 @@ tags:
 Public mirror of every page on [append.page](https://append.page), pushed
 roughly every 10 minutes when any chain changes.
 
-Each file under `pages/` is the JCS-canonicalized JSONL chain of one page.
-Every entry is hash-chained to the one before it, so any later edit,
-deletion, or reorder is mathematically detectable by anyone who kept a copy
-of a prior snapshot (this dataset is one such copy — HuggingFace also
-keeps a full Git history).
+For each page slug `<slug>` you get two files under `pages/`:
+
+- `pages/<slug>.jsonl` — the JCS-canonicalized hash chain (one entry per
+  line, hash-committed to its predecessor). Any later edit, deletion, or
+  reorder is mathematically detectable by anyone who kept a prior snapshot
+  (this dataset is one such copy — HuggingFace also keeps full Git history).
+- `pages/<slug>.bodies.jsonl` — the actual post text + per-entry salt, in
+  the same row order as the chain. Erased entries appear with `body: null`
+  and `erased: true`; `salt` is still present so anyone with a private
+  archive of the body from before erasure can re-verify it offline.
 
 ## Verify a page in one command
+
+Chain only:
 
 ```bash
 python verify.py pages/advisors.jsonl
 ```
 
-Exit code `0` means the chain is intact. The verifier is ~50 lines of
-self-contained Python (stdlib + the `jcs` package for RFC 8785
+Chain plus every body commitment (the full integrity check):
+
+```bash
+python verify.py pages/advisors.jsonl --with-bodies pages/advisors.bodies.jsonl
+```
+
+Exit code `0` means the chain is intact AND every non-erased body
+satisfies `SHA-256(salt || body) == entry.body_commitment`. The verifier
+is self-contained Python (stdlib + the `jcs` package for RFC 8785
 canonicalization) and ships in this repo.
 
 ## Load into Python
@@ -130,7 +159,9 @@ canonicalization) and ships in this repo.
 import json
 with open("pages/advisors.jsonl") as f:
     entries = [json.loads(line) for line in f if line.strip()]
-print(len(entries), "entries")
+with open("pages/advisors.bodies.jsonl") as f:
+    bodies = [json.loads(line) for line in f if line.strip()]
+print(len(entries), "entries,", sum(1 for b in bodies if not b["erased"]), "live bodies")
 ```
 
 ## Docs
@@ -163,17 +194,41 @@ def stage_pages(slugs: list[str]) -> None:
     pages.mkdir(parents=True, exist_ok=True)
 
     existing = {p.name for p in pages.iterdir() if p.is_file()}
-    wanted = {f"{s}.jsonl" for s in slugs}
+    # We mirror two files per page: <slug>.jsonl (chain) and
+    # <slug>.bodies.jsonl (bodies + salts). Both are wanted.
+    wanted: set[str] = set()
+    for s in slugs:
+        wanted.add(f"{s}.jsonl")
+        wanted.add(f"{s}.bodies.jsonl")
 
     for slug in slugs:
-        data = fetch_page_jsonl(slug)
-        target = pages / f"{slug}.jsonl"
-        if target.exists() and target.read_bytes() == data:
-            continue
-        target.write_bytes(data)
-        log(f"updated pages/{slug}.jsonl ({len(data)} bytes)")
+        # Chain.
+        chain = fetch_page_jsonl(slug)
+        chain_target = pages / f"{slug}.jsonl"
+        if not (chain_target.exists() and chain_target.read_bytes() == chain):
+            chain_target.write_bytes(chain)
+            log(f"updated pages/{slug}.jsonl ({len(chain)} bytes)")
 
-    # Remove JSONL files whose slug no longer exists on the site.
+        # Bodies + salts. Same row order as the chain, so a downstream
+        # consumer can `paste` / `zip` the two files line-by-line, or join
+        # on entry_id. Erased entries appear with body=null, salt still
+        # present (matches the API).
+        try:
+            bodies = fetch_page_bodies_jsonl(slug)
+        except RuntimeError as err:
+            log(f"WARN: skipping bodies for {slug}: {err}")
+            continue
+        bodies_target = pages / f"{slug}.bodies.jsonl"
+        if not (
+            bodies_target.exists() and bodies_target.read_bytes() == bodies
+        ):
+            bodies_target.write_bytes(bodies)
+            log(
+                f"updated pages/{slug}.bodies.jsonl ({len(bodies)} bytes)"
+            )
+
+    # Remove files whose slug no longer exists on the site (cleans up
+    # both the chain and the bodies file in one pass).
     for name in existing - wanted:
         (pages / name).unlink()
         log(f"removed pages/{name}")

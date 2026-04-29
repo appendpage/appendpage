@@ -183,8 +183,10 @@ Machine-readable spec: `GET /api/spec.json`.
 | method | path | returns |
 |---|---|---|
 | `GET`  | `/p/:slug/raw` | The canonical chain as `application/x-ndjson` (one JCS-canonical entry per line). **This is the canonical data;** every other endpoint is a presentation of it. |
-| `POST` | `/p/:slug/bodies` | Bulk-fetch bodies + salts for up to 200 entry ids. Body: `{ids: string[]}`. Returns: `{entries: [{entry, body, salt, erased, erased_reason?}]}`. `salt` is 64-char hex and is returned for every entry (erased or not), so anyone with a private body archive can re-verify offline. |
+| `GET`  | `/p/:slug/bodies.jsonl` | Bodies + salts as `application/x-ndjson`, one `{entry_id, body, salt, erased, erased_reason?}` per line. Same row order as `/raw` (sorted by `seq` ascending), so the two files line up 1:1. Erased rows have `body: null` and `erased: true`; `salt` is still returned (anyone with a private archive of the body from before erasure can recompute `SHA-256(salt \|\| body)` to reverify it offline). The curl-friendly partner to `POST /bodies`. |
+| `POST` | `/p/:slug/bodies` | Bulk-fetch bodies + salts for up to 200 entry ids. Body: `{ids: string[]}`. Returns: `{entries: [{entry, body, salt, erased, erased_reason?}]}`. Use `/bodies.jsonl` for stream-everything; use this when you only need a subset by id. |
 | `GET`  | `/p/:slug/e/:id` | Single entry: `{entry, body, salt, erased, erased_reason?}`. |
+| `GET`  | `/p/:slug/archive.zip` | One-click snapshot bundle: `chain.jsonl` + `bodies.jsonl` + `verify.py` + a short `README.md`. Filename `append.page-<slug>-<YYYYMMDD>.zip`. Friendly for non-technical users — extract anywhere, run `python verify.py chain.jsonl --with-bodies bodies.jsonl` offline. |
 | `GET`  | `/p/:slug/views/doc` | LLM-synthesized Doc View as JSON: `{view, head_hash, cached, generated_at, entry_seq_to_id}`. Cached on `(page, prompt, head_hash)`. Add `?stale_ok=1` for stale-while-revalidate. |
 | `GET`  | `/pages` | Page list / search. `?sort=active` (default) returns most recently active; `?q=<text>` returns substring matches on slug + description. |
 
@@ -227,13 +229,18 @@ Exit code `0` = everything intact. Exit code `1` = something is broken (failure 
 ### Other modes
 
 ```bash
-# Offline / from the HuggingFace mirror — chain only
+# One-line offline check — download the bundle, extract, run the verifier:
+curl -O https://append.page/p/advisors/archive.zip
+unzip archive.zip -d advisors-archive && cd advisors-archive
+python verify.py chain.jsonl --with-bodies bodies.jsonl
+
+# Or from the HuggingFace mirror — chain only
 python verify.py path/to/page.jsonl
 
-# Body check from a private archive: assemble bodies.json yourself as
-# {entry_id: {body, salt}} (salt is hex; available from /p/<slug>/bodies
-# even for entries that have since been erased)
-python verify.py path/to/page.jsonl --with-bodies path/to/bodies.json
+# Offline check after downloading both files (or extracting archive.zip):
+python verify.py chain.jsonl --with-bodies bodies.jsonl
+# (`--with-bodies` also accepts the legacy {entry_id: {body, salt}} JSON
+# shape if you assembled one yourself.)
 ```
 
 The verifier is one stdlib-only Python file (`urllib`, `hashlib`, `json` + the `jcs` PyPI package for RFC 8785, with a byte-equivalent fallback if `jcs` isn't installed). It ships at `tools/verify.py` and is copied into every HuggingFace dataset push.
@@ -260,19 +267,21 @@ Serve this from your own domain, GitHub Pages, an `<iframe>` on a blog, or even 
   const raw = await fetch(`${base}/p/${slug}/raw`).then((r) => r.text());
   const chain = raw.trim().split("\n").map((l) => JSON.parse(l));
 
-  // Get the bodies + salts in one batch.
-  const resp = await fetch(`${base}/p/${slug}/bodies`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ids: chain.map((e) => e.id) }),
-  }).then((r) => r.json());
-  const bodyById = Object.fromEntries(resp.entries.map((e) => [e.entry.id, e]));
+  // Get every body + salt in one streamed file (or use POST /bodies if
+  // you only need a subset by id).
+  const bodiesText = await fetch(`${base}/p/${slug}/bodies.jsonl`).then((r) => r.text());
+  const bodyById = Object.fromEntries(
+    bodiesText.trim().split("\n").map((l) => {
+      const o = JSON.parse(l);
+      return [o.entry_id, o];
+    }),
+  );
 
   // Render however you want. Optionally also fetch
   // `${base}/p/${slug}/views/doc` to get the AI-synthesized doc as JSON.
   document.body.innerHTML = chain
     .map((e) => {
-      const b = bodyById[e.id];
+      const b = bodyById[e.id] ?? { erased: true };
       return `<article><h3>#${e.seq}</h3><pre>${b.erased ? "[erased]" : b.body}</pre></article>`;
     })
     .join("");
