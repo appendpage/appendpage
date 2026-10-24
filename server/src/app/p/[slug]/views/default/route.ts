@@ -30,6 +30,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 import { pool } from "@/lib/db";
+import { moderationCacheKey, withModerationGuard } from "@/lib/moderation";
 import {
   BudgetExceededError,
   buildView,
@@ -87,7 +88,8 @@ function backgroundRegenerate(
         `SELECT e.id, e.seq, e.kind, e.parent_id, b.body
            FROM entries e
            LEFT JOIN entry_bodies b ON b.entry_id = e.id
-          WHERE e.page_slug = $1
+          WHERE e.page_slug = $1 AND b.erased_at IS NULL AND b.body IS NOT NULL
+            AND e.kind = 'entry'
           ORDER BY e.seq ASC
           LIMIT 500`,
         [slug],
@@ -155,6 +157,10 @@ export async function GET(
   { params }: { params: Promise<{ slug: string }> },
 ): Promise<Response> {
   const { slug } = await params;
+  return withModerationGuard(slug, (revision) => renderDefault(req, slug, revision));
+}
+
+async function renderDefault(req: NextRequest, slug: string, revision: number): Promise<Response> {
   const { searchParams } = new URL(req.url);
   const cacheOnly = searchParams.get("cache_only") === "1";
   const noCache = searchParams.get("nocache") === "1";
@@ -170,14 +176,11 @@ export async function GET(
   const page = pageRows.rows[0]!;
 
   if (page.head_seq < 0) {
-    return NextResponse.json(
-      { error: "empty_page", message: "page has no entries yet" },
-      { status: 204 },
-    );
+    return new NextResponse(null, { status: 204 });
   }
 
   const prompt = defaultPromptFor(slug);
-  const pHash = promptHash(prompt);
+  const pHash = moderationCacheKey(promptHash(prompt), revision);
 
   // 1. exact-head_hash cache lookup (the "fresh" case)
   if (!noCache) {
@@ -270,7 +273,8 @@ export async function GET(
     `SELECT e.id, e.seq, e.kind, e.parent_id, b.body
        FROM entries e
        LEFT JOIN entry_bodies b ON b.entry_id = e.id
-      WHERE e.page_slug = $1
+      WHERE e.page_slug = $1 AND b.erased_at IS NULL AND b.body IS NOT NULL
+        AND e.kind = 'entry'
       ORDER BY e.seq ASC
       LIMIT 500`,
     [slug],

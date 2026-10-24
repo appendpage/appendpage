@@ -67,5 +67,5 @@ export async function GET(
     salt: row.salt ? row.salt.toString("hex") : null,
     erased,
     ...(erased && row.erased_reason ? { erased_reason: row.erased_reason } : {}),
-  });
+  }, { headers: { "cache-control": "no-store" } });
 }

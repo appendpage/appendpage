@@ -69,6 +69,14 @@ export interface AppendResult {
  * entry that was just committed (with `hash` filled in).
  */
 export async function appendEntry(args: AppendArgs): Promise<AppendResult> {
+  return withTx((client) => appendInTransaction(client, args));
+}
+
+/** Append using the caller's transaction, including the per-page writer lock. */
+export async function appendInTransaction(
+  client: PoolClient,
+  args: AppendArgs,
+): Promise<AppendResult> {
   if (Buffer.byteLength(args.body, "utf8") > 4096) {
     throw new ChainError(
       "body_too_long",
@@ -77,131 +85,129 @@ export async function appendEntry(args: AppendArgs): Promise<AppendResult> {
     );
   }
 
-  return withTx(async (client) => {
-    await acquireSlugLock(client, args.slug);
+  await acquireSlugLock(client, args.slug);
 
-    // Read page state under the lock.
-    const pageRow = await client.query<{
-      slug: string;
-      created_at: Date;
-      head_hash: string;
-      head_seq: number;
-      status: string;
-    }>(
-      `SELECT slug, created_at, head_hash, head_seq, status
-         FROM pages WHERE slug = $1 FOR UPDATE`,
-      [args.slug],
+  // Read page state under the lock.
+  const pageRow = await client.query<{
+    slug: string;
+    created_at: Date;
+    head_hash: string;
+    head_seq: number;
+    status: string;
+  }>(
+    `SELECT slug, created_at, head_hash, head_seq, status
+       FROM pages WHERE slug = $1 FOR UPDATE`,
+    [args.slug],
+  );
+  if (pageRow.rowCount === 0) {
+    throw new ChainError("page_not_found", `page ${args.slug} does not exist`);
+  }
+  const page = pageRow.rows[0]!;
+  if (page.status !== "live") {
+    throw new ChainError(
+      "page_queued_review",
+      `page ${args.slug} is in ${page.status}; not accepting entries yet`,
     );
-    if (pageRow.rowCount === 0) {
-      throw new ChainError("page_not_found", `page ${args.slug} does not exist`);
+  }
+
+  // Compute the prev_hash. For seq == -1 (no entries yet), use genesis seed.
+  const prevHash =
+    page.head_seq < 0
+      ? genesisSeed(args.slug, page.created_at.toISOString())
+      : page.head_hash;
+
+  if (args.expectedPrevHash && args.expectedPrevHash !== prevHash) {
+    throw new ChainError(
+      "head_mismatch",
+      "Expect-Prev-Hash did not match the current head",
+      { actual_head_hash: prevHash },
+    );
+  }
+
+  // Validate parent (if supplied).
+  if (args.parentId !== undefined) {
+    const parent = await client.query<{ page_slug: string; seq: number }>(
+      "SELECT page_slug, seq FROM entries WHERE id = $1",
+      [args.parentId],
+    );
+    if (parent.rowCount === 0) {
+      throw new ChainError("parent_not_found", `parent ${args.parentId} not found`);
     }
-    const page = pageRow.rows[0]!;
-    if (page.status !== "live") {
+    const p = parent.rows[0]!;
+    if (p.page_slug !== args.slug) {
       throw new ChainError(
-        "page_queued_review",
-        `page ${args.slug} is in ${page.status}; not accepting entries yet`,
+        "parent_wrong_page",
+        `parent ${args.parentId} is on page ${p.page_slug}, not ${args.slug}`,
       );
     }
+    // No forward references — parent.seq < new entry's seq is guaranteed by
+    // the fact that parent already exists and we hold the slug lock.
+  }
 
-    // Compute the prev_hash. For seq == -1 (no entries yet), use genesis seed.
-    const prevHash =
-      page.head_seq < 0
-        ? genesisSeed(args.slug, page.created_at.toISOString())
-        : page.head_hash;
+  const newSeq = page.head_seq + 1;
+  const id = ulid();
+  const salt = randomBytes(32);
+  const commitment = bodyCommitment(salt, args.body);
+  const createdAt = new Date();
+  const createdAtIso = createdAt.toISOString();
 
-    if (args.expectedPrevHash && args.expectedPrevHash !== prevHash) {
-      throw new ChainError(
-        "head_mismatch",
-        "Expect-Prev-Hash did not match the current head",
-        { actual_head_hash: prevHash },
-      );
-    }
-
-    // Validate parent (if supplied).
-    if (args.parentId !== undefined) {
-      const parent = await client.query<{ page_slug: string; seq: number }>(
-        "SELECT page_slug, seq FROM entries WHERE id = $1",
-        [args.parentId],
-      );
-      if (parent.rowCount === 0) {
-        throw new ChainError("parent_not_found", `parent ${args.parentId} not found`);
-      }
-      const p = parent.rows[0]!;
-      if (p.page_slug !== args.slug) {
-        throw new ChainError(
-          "parent_wrong_page",
-          `parent ${args.parentId} is on page ${p.page_slug}, not ${args.slug}`,
-        );
-      }
-      // No forward references — parent.seq < new entry's seq is guaranteed by
-      // the fact that parent already exists and we hold the slug lock.
-    }
-
-    const newSeq = page.head_seq + 1;
-    const id = ulid();
-    const salt = randomBytes(32);
-    const commitment = bodyCommitment(salt, args.body);
-    const createdAt = new Date();
-    const createdAtIso = createdAt.toISOString();
-
-    const stripped = buildChainEntry({
-      id,
-      page: args.slug,
-      seq: newSeq,
-      kind: args.kind,
-      parent: args.parentId ?? null,
-      bodyCommitment: commitment,
-      createdAtIso,
-      prevHash,
-    });
-    const { hash } = entryHash(stripped);
-    // Store the JCS canonicalization of the FULL entry (with `hash`).
-    // This is what /raw emits verbatim and what tools/verify.py reads.
-    // Verifiers strip `hash`, re-canonicalize, re-hash, and compare to the
-    // recorded `hash` field — see verify.py.
-    const fullEntry: ChainEntry = { ...stripped, hash };
-    const canonicalBytes = jcsBytes(fullEntry);
-
-    await client.query(
-      `INSERT INTO entries
-         (id, page_slug, seq, kind, parent_id, body_commitment, created_at,
-          prev_hash, hash, canonical_bytes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-      [
-        id,
-        args.slug,
-        newSeq,
-        args.kind,
-        args.parentId ?? null,
-        commitment,
-        createdAt,
-        prevHash,
-        hash,
-        canonicalBytes,
-      ],
-    );
-    await client.query(
-      `INSERT INTO entry_bodies (entry_id, body, salt) VALUES ($1, $2, $3)`,
-      [id, args.body, salt],
-    );
-    await client.query(
-      `INSERT INTO entry_provenance
-         (entry_id, ip_hash, ip_salt_id, captcha_id, user_agent_hash)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [id, args.ipHash, args.ipSaltId, args.captchaId, args.userAgentHash],
-    );
-    await client.query(
-      `UPDATE pages SET head_hash = $1, head_seq = $2 WHERE slug = $3`,
-      [hash, newSeq, args.slug],
-    );
-
-    // pg_notify for the materializer worker. Payload is just the slug;
-    // workers query for entries newer than the last seq they wrote.
-    await client.query(`SELECT pg_notify('page_appended', $1)`, [args.slug]);
-
-    const entry: ChainEntry = { ...stripped, hash };
-    return { entry };
+  const stripped = buildChainEntry({
+    id,
+    page: args.slug,
+    seq: newSeq,
+    kind: args.kind,
+    parent: args.parentId ?? null,
+    bodyCommitment: commitment,
+    createdAtIso,
+    prevHash,
   });
+  const { hash } = entryHash(stripped);
+  // Store the JCS canonicalization of the FULL entry (with `hash`).
+  // This is what /raw emits verbatim and what tools/verify.py reads.
+  // Verifiers strip `hash`, re-canonicalize, re-hash, and compare to the
+  // recorded `hash` field — see verify.py.
+  const fullEntry: ChainEntry = { ...stripped, hash };
+  const canonicalBytes = jcsBytes(fullEntry);
+
+  await client.query(
+    `INSERT INTO entries
+       (id, page_slug, seq, kind, parent_id, body_commitment, created_at,
+        prev_hash, hash, canonical_bytes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [
+      id,
+      args.slug,
+      newSeq,
+      args.kind,
+      args.parentId ?? null,
+      commitment,
+      createdAt,
+      prevHash,
+      hash,
+      canonicalBytes,
+    ],
+  );
+  await client.query(
+    `INSERT INTO entry_bodies (entry_id, body, salt) VALUES ($1, $2, $3)`,
+    [id, args.body, salt],
+  );
+  await client.query(
+    `INSERT INTO entry_provenance
+       (entry_id, ip_hash, ip_salt_id, captcha_id, user_agent_hash)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [id, args.ipHash, args.ipSaltId, args.captchaId, args.userAgentHash],
+  );
+  await client.query(
+    `UPDATE pages SET head_hash = $1, head_seq = $2 WHERE slug = $3`,
+    [hash, newSeq, args.slug],
+  );
+
+  // pg_notify for the materializer worker. Payload is just the slug;
+  // workers query for entries newer than the last seq they wrote.
+  await client.query(`SELECT pg_notify('page_appended', $1)`, [args.slug]);
+
+  const entry: ChainEntry = { ...stripped, hash };
+  return { entry };
 }
 
 /**
@@ -268,21 +274,4 @@ export async function createPage(args: {
       args.status ?? "live",
     ],
   );
-}
-
-/**
- * Convenience for callers (e.g. the admin queue) that already hold a client
- * inside a larger transaction.
- */
-export async function appendInTransaction(
-  client: PoolClient,
-  args: AppendArgs,
-): Promise<AppendResult> {
-  // Reuses the logic above, but caller is responsible for BEGIN/COMMIT.
-  // Phase B will use this when the moderation flow needs to do
-  // DELETE FROM entry_bodies + append a kind=moderation entry atomically.
-  // Walking-skeleton callers should use appendEntry() instead.
-  void client;
-  void args;
-  throw new Error("appendInTransaction: not implemented in Phase A");
 }

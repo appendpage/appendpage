@@ -95,5 +95,5 @@ export async function POST(
     };
   });
 
-  return NextResponse.json({ entries });
+  return NextResponse.json({ entries }, { headers: { "cache-control": "no-store" } });
 }

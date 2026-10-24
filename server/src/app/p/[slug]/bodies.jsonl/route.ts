@@ -109,7 +109,7 @@ export async function GET(
   return new Response(stream, {
     headers: {
       "content-type": "application/x-ndjson; charset=utf-8",
-      "cache-control": "public, max-age=10, stale-while-revalidate=60",
+      "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       // Hint to browsers/curl that this is a downloadable file with a
       // sensible default name. The Raw view also exposes the link via a

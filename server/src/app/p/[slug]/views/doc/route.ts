@@ -48,6 +48,7 @@ import { createHash } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { pool } from "@/lib/db";
+import { moderationCacheKey, withModerationGuard } from "@/lib/moderation";
 import {
   buildDocView,
   type DocView,
@@ -113,6 +114,7 @@ function v2PromptHash(): string {
  */
 async function buildDocOrFallback(args: {
   slug: string;
+  moderationRevision: number;
   description: string;
   v1Prompt: string;
   v1Entries: Array<{
@@ -144,6 +146,7 @@ async function buildDocOrFallback(args: {
         slug: args.slug,
         description: args.description,
         entries: args.v2Entries,
+        moderationRevision: args.moderationRevision,
       });
       console.log(
         `[views.doc ${args.slug}] v2 ok in ${r.generationSeconds.toFixed(1)}s, ` +
@@ -193,6 +196,7 @@ function backgroundRegenerate(
   pHash: string,
   v1Prompt: string,
   targetHeadHash: string,
+  moderationRevision: number,
 ): void {
   void (async () => {
     const lockKey = `docview-regen:${slug}:${pHash}:${targetHeadHash}`;
@@ -219,6 +223,7 @@ function backgroundRegenerate(
       const entries = await fetchEntries(slug);
       const result = await buildDocOrFallback({
         slug,
+        moderationRevision,
         description,
         v1Prompt,
         v1Entries: entries.map((e) => ({
@@ -355,6 +360,10 @@ export async function GET(
   { params }: { params: Promise<{ slug: string }> },
 ): Promise<Response> {
   const { slug } = await params;
+  return withModerationGuard(slug, (revision) => renderDoc(req, slug, revision));
+}
+
+async function renderDoc(req: NextRequest, slug: string, moderationRevision: number): Promise<Response> {
   const { searchParams } = new URL(req.url);
   const cacheOnly = searchParams.get("cache_only") === "1";
   const noCache = searchParams.get("nocache") === "1";
@@ -383,7 +392,9 @@ export async function GET(
 
   // Pipeline-aware cache key.
   const v1Prompt = docPromptFor(slug, page.description);
-  const pHash = useV2() ? v2PromptHash() : docPromptHash(v1Prompt);
+  const pHash = moderationCacheKey(
+    useV2() ? v2PromptHash() : docPromptHash(v1Prompt), moderationRevision,
+  );
 
   // The seq->id map is needed for any 200 response; do it once.
   const seqToIdPromise = fetchSeqToId(slug);
@@ -440,7 +451,7 @@ export async function GET(
       );
       const entriesSince = parseInt(since.rows[0]?.delta ?? "0", 10);
 
-      backgroundRegenerate(slug, page.description, pHash, v1Prompt, page.head_hash);
+      backgroundRegenerate(slug, page.description, pHash, v1Prompt, page.head_hash, moderationRevision);
 
       const entry_seq_to_id = await seqToIdPromise;
       return NextResponse.json(
@@ -478,6 +489,7 @@ export async function GET(
   try {
     result = await buildDocOrFallback({
       slug,
+      moderationRevision,
       description: page.description,
       v1Prompt,
       v1Entries: entries.map((e) => ({

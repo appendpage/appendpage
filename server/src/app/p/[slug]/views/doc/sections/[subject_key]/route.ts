@@ -31,6 +31,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 import { pool } from "@/lib/db";
+import { moderationCacheKey, withModerationGuard } from "@/lib/moderation";
 import { SECTION_PROMPT_VERSION } from "@/lib/docview-v2";
 
 export const dynamic = "force-dynamic";
@@ -54,6 +55,10 @@ export async function GET(
   }: { params: Promise<{ slug: string; subject_key: string }> },
 ): Promise<Response> {
   const { slug, subject_key } = await params;
+  return withModerationGuard(slug, (revision) => renderSection(slug, subject_key, revision));
+}
+
+async function renderSection(slug: string, subject_key: string, revision: number): Promise<Response> {
 
   // Validate subject_key shape (64-char hex SHA-256). Reject anything
   // else upfront so a malformed URL doesn't pollute the cache lookup.
@@ -82,7 +87,7 @@ export async function GET(
         AND subject_key = $3
       ORDER BY created_at DESC
       LIMIT 1`,
-    [slug, SECTION_PROMPT_VERSION, subject_key],
+    [slug, moderationCacheKey(SECTION_PROMPT_VERSION, revision), subject_key],
   );
   if (r.rows.length === 0) {
     return NextResponse.json(

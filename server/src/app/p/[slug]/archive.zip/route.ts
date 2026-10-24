@@ -137,9 +137,8 @@ export async function GET(
     headers: {
       "content-type": "application/zip",
       "content-length": String(zipped.byteLength),
-      // Slightly looser than /raw because zipping costs more CPU; SWR keeps
-      // bursts cheap (the same archive serves many concurrent downloads).
-      "cache-control": "public, max-age=60, stale-while-revalidate=600",
+      // Do not let shared caches continue distributing withheld bodies.
+      "cache-control": "no-store",
       "content-disposition": `attachment; filename="append.page-${slug}-${stamp}.zip"`,
       "x-content-type-options": "nosniff",
     },

@@ -40,6 +40,7 @@ import { z } from "zod";
 
 import { commitOverage, reserveBudget } from "./budget";
 import { pool } from "./db";
+import { moderationCacheKey } from "./moderation";
 import { type DocView } from "./docview";
 import { BudgetExceededError } from "./llm";
 import { dedupeSubjects } from "./subject-dedup";
@@ -566,13 +567,14 @@ async function lookupSectionCache(
   slug: string,
   sk: string,
   mh: string,
+  revision: number,
 ): Promise<CachedSectionRow | null> {
   const r = await pool.query<CachedSectionRow>(
     `SELECT view_json, cost_usd
        FROM view_section_cache
       WHERE page_slug = $1 AND prompt_version = $2
         AND subject_key = $3 AND members_hash = $4`,
-    [slug, SECTION_PROMPT_VERSION, sk, mh],
+    [slug, moderationCacheKey(SECTION_PROMPT_VERSION, revision), sk, mh],
   );
   return r.rows[0] ?? null;
 }
@@ -585,6 +587,7 @@ async function writeSectionCache(
   tokensUsed: number,
   costUsd: number,
   model: string,
+  revision: number,
 ): Promise<void> {
   await pool.query(
     `INSERT INTO view_section_cache
@@ -595,7 +598,7 @@ async function writeSectionCache(
        DO NOTHING`,
     [
       slug,
-      SECTION_PROMPT_VERSION,
+      moderationCacheKey(SECTION_PROMPT_VERSION, revision),
       sk,
       mh,
       JSON.stringify(json),
@@ -719,6 +722,7 @@ function planClusters(
 
 export interface BuildDocV2Args {
   slug: string;
+  moderationRevision: number;
   description: string;
   /** All chain entries (we'll filter out erased ones internally).
    *  parent_id + parent_body are passed through to the v3+ tagger so a
@@ -876,7 +880,7 @@ export async function buildDocV2(
     clusters.map(async (cluster) => {
       const sk = subjectKey(cluster.rawSubject);
       const mh = membersHash(cluster.members);
-      const cached = await lookupSectionCache(args.slug, sk, mh);
+      const cached = await lookupSectionCache(args.slug, sk, mh, args.moderationRevision);
       if (cached) {
         cacheHits++;
         return {
@@ -914,6 +918,7 @@ export async function buildDocV2(
         fresh.tokensUsed,
         fresh.costUsd,
         fresh.model,
+        args.moderationRevision,
       ).catch((err) => {
         console.error(`[docview-v2 ${args.slug}] section cache write failed:`, err);
       });

@@ -22,6 +22,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 import { pool } from "@/lib/db";
+import { withModerationGuard } from "@/lib/moderation";
 import { BudgetExceededError } from "@/lib/llm";
 import {
   backgroundExtract,
@@ -55,6 +56,10 @@ export async function GET(
   { params }: { params: Promise<{ slug: string }> },
 ): Promise<Response> {
   const { slug } = await params;
+  return withModerationGuard(slug, () => renderTags(req, slug));
+}
+
+async function renderTags(req: NextRequest, slug: string): Promise<Response> {
   const { searchParams } = new URL(req.url);
   const staleOk = searchParams.get("stale_ok") === "1";
 
@@ -87,6 +92,7 @@ export async function GET(
        LEFT JOIN entry_tags   t  ON t.entry_id  = e.id
                                     AND t.prompt_version = $2
       WHERE e.page_slug = $1 AND e.kind = 'entry'
+        AND b.erased_at IS NULL AND b.body IS NOT NULL
       ORDER BY e.seq ASC`,
     [slug, TAG_PROMPT_VERSION],
   );
