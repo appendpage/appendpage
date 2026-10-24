@@ -474,8 +474,9 @@ async function renderDoc(req: NextRequest, slug: string, moderationRevision: num
         },
       );
     }
-    // No cache yet — let the caller fall back to chrono while a fresh
-    // visit triggers inline generation. Don't block here.
+    // A moderation decision invalidates every previous cached version.
+    // Rebuild on a cache miss as well, without blocking the caller.
+    if (!cacheOnly) backgroundRegenerate(slug, page.description, pHash, v1Prompt, page.head_hash, moderationRevision);
     return new NextResponse(null, { status: 204 });
   }
 

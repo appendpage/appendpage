@@ -31,6 +31,9 @@ vi.mock("../src/lib/tags", async (original) => ({
   ...await original<typeof import("../src/lib/tags")>(),
   backgroundExtract: vi.fn(),
 }));
+// Simulate another worker already holding the doc-regeneration lock. These
+// tests inspect visibility and must never call an external model.
+vi.mock("../src/lib/redis", () => ({ redis: { set: vi.fn().mockResolvedValue(null) } }));
 
 const testUrl = process.env.APPENDPAGE_TEST_DATABASE_URL;
 if (testUrl && !new URL(testUrl).pathname.endsWith("_test")) {

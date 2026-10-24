@@ -74,6 +74,23 @@ const SPEC = {
   endpoints: [
     {
       method: "POST",
+      path: "/api/reports",
+      summary: "Submit a private moderation request. No login; rate-limited. Does not change public content.",
+      request: {
+        type: "object", additionalProperties: false,
+        required: ["id", "page", "entry_id", "reason"],
+        properties: {
+          id: { type: "string", format: "uuid", description: "Idempotency key; reuse on retries." },
+          page: { $ref: "#/definitions/Slug" },
+          entry_id: { $ref: "#/definitions/UlidId" },
+          reason: { type: "string", enum: ["harassment", "privacy", "misleading", "spam", "other"] },
+          details: { type: "string", maxLength: 2000 },
+        },
+      },
+      response_202: { type: "object", properties: { ok: { const: true } } },
+    },
+    {
+      method: "POST",
       path: "/p/{slug}/entries",
       summary:
         "Append an entry to a page's chain. Rate-limited per IP; see /AGENTS.md §7.",

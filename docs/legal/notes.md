@@ -1,6 +1,6 @@
 # About append.page
 
-`append.page` is a personal research demo by [Yuntian Deng (@da03)](https://github.com/da03), University of Waterloo. It's an experiment in append-only public-feedback platforms — not a business, not a moderated forum, not a production service. I run it on a small server out of personal interest in giving the community something more honest than a Google Doc that keeps getting deleted.
+`append.page` is a personal research demo by [Yuntian Deng (@da03)](https://github.com/da03), University of Waterloo. It's an experiment in append-only public-feedback platforms. I run it on a small server out of personal interest in giving the community something more honest than a Google Doc that keeps getting deleted.
 
 If anything below feels like generic legal text, it's not — this is what I actually do, in plain English.
 
@@ -15,6 +15,7 @@ If anything below feels like generic legal text, it's not — this is what I act
 - Server access logs (timestamp, path, status code, user-agent), kept ~14 days like any nginx default.
 - For each post: a SHA-256 hash of your IP address, a hash of your user-agent, the body of your post, and a 32-byte salt used to compute the on-chain commitment. The raw IP and the raw user-agent are never written to disk.
 - The body and salt live in a private database table; only the hash-commitment goes on the public chain.
+- Moderation reports: the reported post, selected reason, optional explanation, submission time, and review decision. Reports are private and are not included in the public chain, downloads, HuggingFace mirror, or AI prompts. Please avoid including sensitive personal information. IP-based rate-limit counters expire automatically; reports do not store your IP address or require contact details.
 
 ## What I share
 
@@ -24,7 +25,7 @@ If anything below feels like generic legal text, it's not — this is what I act
 ## What I don't do
 
 - I don't sell data, run trackers, run analytics, or show ads.
-- I don't require accounts or logins.
+- Posting and reporting do not require accounts or logins. The private moderation queue requires an administrator login.
 - I don't share your IP hash or user-agent hash with anyone.
 
 ## Before you post, please know
@@ -43,15 +44,15 @@ If anything below feels like generic legal text, it's not — this is what I act
 - **Spam** — automated posts, link spam, advertising.
 - **Personal data of identifiable third parties** beyond what's needed to make a substantive point. "Prof. X was hostile to my research direction" is fine; posting Prof. X's home phone number is not.
 
-If you violate this, I'll erase the body without notice. Repeat offenders' IP-hash ranges may be rate-limited or blocked.
+Content that violates these rules may be withheld following review. The original text and salt are retained privately; a public moderation entry records the action. Repeat offenders' IP-hash ranges may be rate-limited or blocked.
 
 ## How to remove your post (or report something)
 
-Open a [GitHub issue](https://github.com/appendpage/appendpage/issues) with the URL of the entry. A title like one of these helps me triage fast:
+Click **Report** beside the post or reply, choose a reason, and add context if useful. Only the moderator can see the request. Reports are reviewed by a person; report counts do not automatically hide posts. For a removal request about your own post, choose **Something else** and explain the request.
 
-- `erasure: <slug>/<entry-id>` — you want your own post removed
-- `takedown: <slug>/<entry-id>` — content that violates the rules above
-- `[abuse] ...` — spam, harassment
+If content is withheld, the website and future exports stop serving its body, while the chain retains the original commitment and a public moderation record. Copies downloaded earlier and earlier mirror revisions may still contain it.
+
+Use [GitHub issues](https://github.com/appendpage/appendpage/issues) for product feedback, not private reports.
 
 Target response: ~7 days, best effort. For [security disclosures](https://github.com/appendpage/appendpage/security/advisories/new), use GitHub Security Advisories instead so the discussion is private.
 

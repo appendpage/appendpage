@@ -16,7 +16,7 @@ Two layers, kept deliberately separate:
   - **Chronological** — raw posts in time order, newest first.
   - **Raw JSONL** — the canonical wire format itself.
 
-Every read endpoint is CORS-open, so anyone can write a different frontend at any origin and have it work against the live data — see §9.
+Public read and write endpoints are CORS-open, so anyone can write a different frontend at any origin — see §9. Private `/api/admin/*` endpoints require authentication and do not allow cross-origin access.
 
 ---
 
@@ -127,16 +127,16 @@ A linear singly-linked list. To verify, walk forward: recompute each entry's `ha
 - **Chain link** (`prev_hash`) → by **hash**. Has to be a hash for tamper-evidence.
 - **Reply link** (`parent`) → by **id**. The parent's `hash` never changes (body erasure doesn't touch the on-chain entry, only the off-chain body+salt), so id and hash are equivalent here; id wins on brevity.
 
-### Erasure (body removal under the law)
+### Withholding content after moderation review
 
-Bodies live off-chain in a private `entry_bodies(entry_id, body, salt, ...)` table. The on-chain entry only commits to `H(salt ‖ body)`. When the operator honors an erasure request:
+Bodies live off-chain in a private `entry_bodies(entry_id, body, salt, ...)` table. The on-chain entry only commits to `H(salt ‖ body)`. When the operator withholds a post, one transaction performs both steps:
 
 ```
 1. UPDATE entry_bodies
-     SET body='', erased_at=now(), erased_reason='...'
+     SET erased_at=now(), erased_reason='...'
      WHERE entry_id = X.
 2. Append a NEW entry with kind="moderation", parent=X, and a body
-   explaining the action ("Erased on request. Reason: harassment.").
+   explaining the action ("Content withheld following moderation review.").
 ```
 
 What's left on the chain afterwards:
@@ -147,7 +147,7 @@ What's left on the chain afterwards:
 - The `kind=moderation` entry is the permanent public record of the action.
 - `body_commitment` proves something specific *was* committed at X. Anyone who saved `(body, salt)` before erasure can still verify their copy by computing `SHA-256(salt ‖ body)` and comparing.
 
-This is what justifies the salted-commitment complexity: erasure removes our ability to *serve* the body; it does not remove the *fact* that something was committed at that position, and it does not invalidate the chain.
+The original body and salt are retained privately. Public body endpoints return `body: null`, `erased: true`, the reason, and the original salt. Withholding does not change the original chain entry or recall earlier downloads. AI views are invalidated when moderation changes.
 
 ---
 
@@ -173,7 +173,7 @@ Machine-readable spec: `GET /api/spec.json`.
 
 ### Conventions (apply to every endpoint)
 
-- **CORS.** Every endpoint, read or write, sets `Access-Control-Allow-Origin: *`. A browser at any origin can call them. Per-IP rate limits do all the abuse protection.
+- **CORS.** Public endpoints allow any origin. Private `/api/admin/*` endpoints require an administrator session and same-origin writes. Public writes are rate-limited by the backend.
 - **Rate limits.** Per-IP, configured in the `rate_limit_config` PG table and tunable at runtime. Defaults: **30 entries/min, 300 entries/hr, 10 pages/hr, 40 pages/day**. Returned as `429 Too Many Requests` with a `Retry-After` header.
 - **Optimistic concurrency.** On `POST /p/:slug/entries`, send `Expect-Prev-Hash: <hash>`; if it doesn't match the current head, returns `409 Conflict` with `{actual_head_hash}`.
 - **Bulk download.** `git clone https://huggingface.co/datasets/appendpage/ledger` — every page as JSONL plus `verify.py`, refreshed hourly.
@@ -207,6 +207,12 @@ Machine-readable spec: `GET /api/spec.json`.
 | `POST` | `/pages` | `{slug: string, description?: string}` | `{slug, status: "live" \| "queued_review"}` — `queued_review` means the slug looks like a personal name and needs operator review before going live. |
 
 ---
+
+### Report a post or reply
+
+`POST /api/reports` accepts JSON with `id` (a fresh UUID), `page` (slug), `entry_id`, `reason`, and optional `details` (up to 2,000 characters). Reasons: `harassment`, `privacy`, `misleading`, `spam`, `other`. Reuse the same UUID when retrying the same request. Success: `202 {"ok":true}`. Errors: `400` invalid input, `404` missing post, `429` rate limit with `Retry-After`, `503` temporarily unavailable.
+
+No login is needed. Defaults are 10 reports/minute and 40/hour per IP, configurable at runtime. Reports are private requests, excluded from public data and AI views. They never hide content automatically. Show the reporting action on individual posts and replies; the operator reviews requests separately.
 
 ## 8. Verifier — `verify.py`
 

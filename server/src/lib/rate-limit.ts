@@ -17,6 +17,7 @@
  */
 import { pool } from "./db";
 import { redis } from "./redis";
+import { isIP } from "node:net";
 
 const REFRESH_MS = 30_000;
 
@@ -44,7 +45,7 @@ async function loadConfig(): Promise<void> {
   }
 }
 
-async function getLimit(key: string): Promise<number> {
+async function getLimit(key: string, fallback = Infinity): Promise<number> {
   const stale = Date.now() - cache.loadedAt > REFRESH_MS;
   if (stale) {
     if (!inFlightLoad) {
@@ -57,18 +58,29 @@ async function getLimit(key: string): Promise<number> {
       await inFlightLoad;
     }
   }
-  return cache.map.get(key) ?? Infinity; // unknown key = unlimited
+  return cache.map.get(key) ?? fallback;
 }
 
 /** Normalize an IP for rate-limiting: IPv4 /32, IPv6 /64. */
 export function normalizeIp(raw: string): string {
-  const ip = raw.trim();
-  if (ip.includes(":")) {
-    // IPv6 — keep only the first 4 groups (the /64 prefix).
-    const parts = ip.split(":").filter((p) => p.length > 0);
-    return parts.slice(0, 4).join(":") + "::/64";
+  let ip = raw.trim().toLowerCase();
+  if (isIP(ip) === 4) return ip + "/32";
+  if (isIP(ip) !== 6) return "unknown";
+  // Convert an embedded IPv4 suffix before expanding compressed IPv6 groups.
+  if (ip.includes(".")) {
+    const pos = ip.lastIndexOf(":");
+    const bytes = ip.slice(pos + 1).split(".").map(Number);
+    ip = ip.slice(0, pos + 1) + ((bytes[0]! << 8) | bytes[1]!).toString(16) + ":" +
+      ((bytes[2]! << 8) | bytes[3]!).toString(16);
   }
-  return ip + "/32";
+  const [left, right] = ip.split("::");
+  const a = left ? left.split(":") : [];
+  const b = right ? right.split(":") : [];
+  const groups = (right !== undefined ? [...a, ...Array(8 - a.length - b.length).fill("0"), ...b] : a).map((s) => parseInt(s, 16));
+  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 65535) {
+    return `${groups[6]! >> 8}.${groups[6]! & 255}.${groups[7]! >> 8}.${groups[7]! & 255}/32`;
+  }
+  return groups.slice(0, 4).map((g) => g.toString(16)).join(":") + "::/64";
 }
 
 export interface RateLimitDecision {
@@ -97,18 +109,19 @@ export async function check(
   action: string,
   configKey: string,
   windowSeconds: number,
+  fallback?: number,
 ): Promise<RateLimitDecision> {
-  const limit = await getLimit(configKey);
+  const limit = await getLimit(configKey, fallback);
   if (!isFinite(limit)) {
     return { ok: true, limit: Infinity, used: 0, resetAfterSeconds: 0, key: configKey };
   }
   const windowId = Math.floor(Date.now() / 1000 / windowSeconds);
   const rkey = `rl:${action}:${configKey}:${ipNormalized}:${windowId}`;
-  const used = await redis.incr(rkey);
-  // Set TTL on the FIRST increment of a window so the key self-cleans.
-  if (used === 1) {
-    await redis.expire(rkey, windowSeconds + 10);
-  }
+  // Increment and expiry must be atomic even if the process stops mid-request.
+  const used = Number(await redis.eval(
+    "local n = redis.call('INCR', KEYS[1]); if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end; return n",
+    1, rkey, windowSeconds + 10,
+  ));
   const ok = used <= limit;
   const resetAfterSeconds = windowSeconds - (Math.floor(Date.now() / 1000) % windowSeconds);
   return { ok, limit, used, resetAfterSeconds, key: configKey };
@@ -121,10 +134,10 @@ export async function check(
 export async function checkAll(
   ipNormalized: string,
   action: string,
-  rules: Array<{ configKey: string; windowSeconds: number }>,
+  rules: Array<{ configKey: string; windowSeconds: number; fallback?: number }>,
 ): Promise<RateLimitDecision> {
   for (const rule of rules) {
-    const r = await check(ipNormalized, action, rule.configKey, rule.windowSeconds);
+    const r = await check(ipNormalized, action, rule.configKey, rule.windowSeconds, rule.fallback);
     if (!r.ok) return r;
   }
   // Return a synthetic-ok decision keyed to the last rule (the tightest one).
@@ -140,13 +153,13 @@ export async function checkAll(
 
 /**
  * Convenience: extract + normalize the client IP from a NextRequest-style
- * headers getter. Trusts x-forwarded-for because nginx sets it.
+ * headers getter. The backend must be behind the trusted nginx proxy, which
+ * overwrites X-Real-IP. The first X-Forwarded-For element is client-controlled.
  */
 export function clientIpFromHeaders(
   headerGet: (name: string) => string | null,
 ): string {
   const xff = headerGet("x-forwarded-for");
   const xri = headerGet("x-real-ip");
-  const first = xff?.split(",")[0]?.trim() ?? xri ?? "0.0.0.0";
-  return normalizeIp(first);
+  return normalizeIp(xri ?? xff?.split(",").at(-1)?.trim() ?? "0.0.0.0");
 }

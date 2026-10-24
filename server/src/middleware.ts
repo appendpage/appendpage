@@ -9,7 +9,7 @@
  * even a file:// page open in a browser tab), we have to say so to the
  * browser via Access-Control-Allow-Origin.
  *
- * Policy: every endpoint is CORS-open (`Access-Control-Allow-Origin: *`).
+ * Policy: public endpoints are CORS-open; /api/admin is private.
  *
  * That includes write endpoints (POST /p/<slug>/entries, POST /pages).
  * Why open writes too:
@@ -44,6 +44,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 export function middleware(req: NextRequest): NextResponse {
+  if (req.nextUrl.pathname === "/api/admin" || req.nextUrl.pathname.startsWith("/api/admin/")) {
+    if (req.method === "OPTIONS") return new NextResponse(null, { status: 403 });
+    const response = NextResponse.next();
+    response.headers.set("cache-control", "no-store");
+    return response;
+  }
   const origin = req.headers.get("origin");
   const isCrossOrigin = !!origin;
 
