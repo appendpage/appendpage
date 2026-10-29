@@ -210,9 +210,11 @@ Machine-readable spec: `GET /api/spec.json`.
 
 ### Report a post or reply
 
-`POST /api/reports` accepts JSON with `id` (a fresh UUID), `page` (slug), `entry_id`, `reason`, and optional `details` (up to 2,000 characters). Reasons: `harassment`, `privacy`, `misleading`, `spam`, `other`. Reuse the same UUID when retrying the same request. Success: `202 {"ok":true}`. Errors: `400` invalid input, `404` missing post, `429` rate limit with `Retry-After`, `503` temporarily unavailable.
+`POST /api/reports` accepts JSON with `id` (a fresh UUID), `page` (slug), `entry_id`, `reason`, and optional `details` (up to 2,000 characters). Reasons: `harassment`, `privacy`, `misleading`, `spam`, `other`. Reuse the same UUID when retrying the same request. Success: `202 {"ok":true,"withheld":true}`. `withheld` reports the current visibility; retrying an old report after restoration returns `false`. Errors: `400` invalid input, `404` missing post, `429` rate limit with `Retry-After`, `503` temporarily unavailable.
 
-No login is needed. Defaults are 10 reports/minute and 40/hour per IP, configurable at runtime. Reports are private requests, excluded from public data and AI views. They never hide content automatically. Show the reporting action on individual posts and replies; the operator reviews requests separately.
+No login is needed. Defaults are 10 reports/minute and 40/hour per IP, configurable at runtime. Each new report immediately hides a visible post with the message “Content temporarily hidden pending moderation review.” Saving the report, withholding its body, and appending a generic public moderation record happen in one transaction. Report explanations and reasons remain private and are excluded from public data and AI views. Show the reporting action on individual posts and replies, then refresh the view after success.
+
+The operator can restore the original post or keep it withheld after review. Both changes append public moderation records without altering original text, salts, or existing chain entries. A new report hides a restored post again; retrying the original report does not. Reports that arrive after the operator loaded the queue remain pending and keep the post hidden until reviewed. Current public exports exclude withheld bodies; earlier downloads and mirror revisions are not recalled.
 
 ## 8. Verifier — `verify.py`
 

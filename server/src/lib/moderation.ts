@@ -5,6 +5,17 @@ import { appendInTransaction } from "./chain";
 import { acquireSlugLock, pool, withTx } from "./db";
 import { SLUG_REGEX, ULID_REGEX } from "./types";
 
+export const PENDING_REVIEW_REASON = "Content temporarily hidden pending moderation review.";
+export const REVIEWED_WITHHOLD_REASON = "Content withheld following moderation review.";
+export const RESTORED_REASON = "Content restored following moderation review.";
+
+interface ModerationArgs {
+  slug: string;
+  entryIds: string[];
+  reason: string;
+  actor: string;
+}
+
 /** Moderation records are appended atomically with visibility changes. */
 export async function moderationRevision(slug: string): Promise<number> {
   const result = await pool.query<{ revision: number }>(
@@ -54,12 +65,21 @@ export async function withholdEntries(args: {
 }
 
 /** Shares the transaction with a private report decision. Never a public API. */
-export async function withholdInTransaction(client: PoolClient, args: {
-  slug: string;
-  entryIds: string[];
-  reason: string;
-  actor: string;
-}): Promise<Array<{ targetId: string; moderationId: string; seq: number }>> {
+export async function withholdInTransaction(client: PoolClient, args: ModerationArgs) {
+  return changeVisibilityInTransaction(client, args, "withhold");
+}
+
+export async function temporarilyWithholdInTransaction(client: PoolClient, args: Omit<ModerationArgs, "reason">) {
+  return changeVisibilityInTransaction(client, { ...args, reason: PENDING_REVIEW_REASON }, "pending");
+}
+
+export async function restoreInTransaction(client: PoolClient, args: Omit<ModerationArgs, "reason">) {
+  return changeVisibilityInTransaction(client, { ...args, reason: RESTORED_REASON }, "restore");
+}
+
+async function changeVisibilityInTransaction(client: PoolClient, args: ModerationArgs,
+  action: "withhold" | "pending" | "restore",
+): Promise<Array<{ targetId: string; moderationId: string; seq: number }>> {
   if (!SLUG_REGEX.test(args.slug) || args.entryIds.length === 0 ||
       new Set(args.entryIds).size !== args.entryIds.length ||
       args.entryIds.some((id) => !ULID_REGEX.test(id)) ||
@@ -69,9 +89,9 @@ export async function withholdInTransaction(client: PoolClient, args: {
 
   await acquireSlugLock(client, args.slug);
   const targets = await client.query<{
-    id: string; seq: number; kind: string; erased_at: Date | null;
+    id: string; seq: number; kind: string; erased_at: Date | null; withheld_pending_review: boolean;
   }>(
-    `SELECT e.id, e.seq, e.kind, b.erased_at
+    `SELECT e.id, e.seq, e.kind, b.erased_at, b.withheld_pending_review
        FROM entries e JOIN entry_bodies b ON b.entry_id = e.id
       WHERE e.page_slug = $1 AND e.id = ANY($2::text[])
       ORDER BY e.seq FOR UPDATE OF b`,
@@ -82,7 +102,11 @@ export async function withholdInTransaction(client: PoolClient, args: {
     throw new Error("Every target must be an existing post on this page");
   }
   // Refuse accidental retries rather than appending duplicate decisions.
-  if (targets.rows.some((row) => row.erased_at !== null)) {
+  if (action === "restore" && targets.rows.some((row) => row.erased_at === null)) {
+    throw new Error("A target is already visible; no changes made");
+  }
+  if (action !== "restore" && targets.rows.some((row) => row.erased_at !== null &&
+      !(action === "withhold" && row.withheld_pending_review))) {
     throw new Error("A target is already withheld; no changes made");
   }
 
@@ -99,14 +123,15 @@ export async function withholdInTransaction(client: PoolClient, args: {
       userAgentHash: "operator",
     });
     await client.query(
-      `UPDATE entry_bodies SET erased_at = now(), erased_reason = $2
+      `UPDATE entry_bodies SET erased_at = CASE WHEN $3 THEN NULL ELSE COALESCE(erased_at, now()) END,
+         erased_reason = CASE WHEN $3 THEN NULL ELSE $2 END, withheld_pending_review = $4
         WHERE entry_id = $1`,
-      [target.id, args.reason],
+      [target.id, args.reason, action === "restore", action === "pending"],
     );
     await client.query(
       `INSERT INTO moderation_log (entry_id, action, reason, actor)
-       VALUES ($1, 'erase', $2, $3)`,
-      [target.id, args.reason, args.actor],
+       VALUES ($1, $2, $3, $4)`,
+      [target.id, action === "restore" ? "restore" : action === "pending" ? "temporarily_withhold" : "erase", args.reason, args.actor],
     );
     actions.push({ targetId: target.id, moderationId: entry.id, seq: entry.seq });
   }

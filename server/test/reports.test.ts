@@ -5,7 +5,9 @@ import { NextRequest } from "next/server";
 import { beforeAll, beforeEach, afterAll, describe, expect, it, vi } from "vitest";
 import { pool } from "../src/lib/db";
 import { appendEntry, createPage } from "../src/lib/chain";
-import { pendingReports, resolveReports, submitReport } from "../src/lib/reports";
+import { hidePendingReports, pendingReports, resolveReports, submitReport } from "../src/lib/reports";
+import { PENDING_REVIEW_REASON, RESTORED_REASON, REVIEWED_WITHHOLD_REASON, moderationRevision } from "../src/lib/moderation";
+import { entryHash } from "../src/lib/jcs";
 import { POST as report } from "../src/app/api/reports/route";
 import { POST as login } from "../src/app/api/admin/login/route";
 import { POST as logout } from "../src/app/api/admin/logout/route";
@@ -83,17 +85,21 @@ describe.skipIf(!testUrl)("private report workflow (PostgreSQL integration)", ()
   });
   afterAll(async () => { await pool.query(`DROP SCHEMA ${schema} CASCADE`); await pool.end(); });
 
-  it("accepts private reports without accounts and deduplicates retries without changing public data", async () => {
+  it("atomically hides reported content, keeps explanations private, and deduplicates retries", async () => {
     const data = input();
-    expect((await report(request("/api/reports", data))).status).toBe(202);
+    const response = await report(request("/api/reports", data));
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ ok: true, withheld: true });
     expect((await report(request("/api/reports", data))).status).toBe(202);
     expect((await pool.query("SELECT * FROM moderation_reports")).rows).toHaveLength(1);
-    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(1);
+    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(2);
     const jsonl = await (await bodiesFile(request(`/p/${slug}/bodies.jsonl`), { params: Promise.resolve({ slug }) })).text();
-    expect(jsonl).toContain("Original post");
+    expect(jsonl).not.toContain("Original post");
+    expect(jsonl).toContain(PENDING_REVIEW_REASON);
     expect(jsonl).not.toContain(data.details);
     const pending = await pendingReports();
     expect(pending.entries[0].reports[0].details).toBe(data.details);
+    expect(pending.entries[0]).toMatchObject({ body: "Original post", withheld: true, withheld_pending_review: true });
   });
 
   it("validates targets, reasons, sizes, and enforces per-IP limits", async () => {
@@ -126,12 +132,30 @@ describe.skipIf(!testUrl)("private report workflow (PostgreSQL integration)", ()
     expect((await pool.query("SELECT status FROM moderation_reports")).rows[0].status).toBe("pending");
   });
 
-  it("keeps content visible when a report is dismissed and does not publish private explanations", async () => {
+  it("restores the original content with a public action and hides it on a new report, not a retry", async () => {
+    const before = (await pool.query("SELECT body,salt FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0];
     const data = input(); await submitReport(data);
-    await resolveReports({ entry_id: entry.id, report_ids: [data.id], decision: "keep" }, "reviewer");
-    expect((await pool.query("SELECT erased_at FROM entry_bodies")).rows[0].erased_at).toBeNull();
-    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(1);
+    await resolveReports({ entry_id: entry.id, report_ids: [data.id], decision: "restore" }, "reviewer");
+    expect((await pool.query("SELECT erased_at,withheld_pending_review FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0]).toEqual({ erased_at: null, withheld_pending_review: false });
+    expect((await pool.query("SELECT body,salt FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0]).toEqual(before);
+    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(3);
     expect((await pendingReports()).total).toBe(0);
+    expect(await submitReport(data)).toEqual({ withheld: false });
+    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(3);
+    const visible = await (await bodiesFile(request(`/p/${slug}/bodies.jsonl`), { params: Promise.resolve({ slug }) })).text();
+    expect(visible).toContain("Original post"); expect(visible).toContain(RESTORED_REASON);
+    expect(visible).not.toContain(data.details);
+    const fresh = input();
+    expect(await submitReport(fresh)).toEqual({ withheld: true });
+    const rows = (await pool.query("SELECT canonical_bytes FROM entries ORDER BY seq")).rows;
+    const chain = rows.map((row) => JSON.parse(row.canonical_bytes.toString()));
+    expect(chain).toHaveLength(4);
+    expect(chain[0]).toEqual(entry);
+    chain.forEach(({ hash, ...rest }, index) => {
+      expect(entryHash(rest).hash).toBe(hash);
+      if (index) expect(rest.prev_hash).toBe(chain[index - 1].hash);
+    });
+    expect(await moderationRevision(slug)).toBe(3);
   });
 
   it("withholds atomically, preserves originals, and concurrent retries append only one public action", async () => {
@@ -140,7 +164,8 @@ describe.skipIf(!testUrl)("private report workflow (PostgreSQL integration)", ()
     const action = { entry_id: entry.id, report_ids: [data.id], decision: "withhold" as const };
     await Promise.all([resolveReports(action, "reviewer"), resolveReports(action, "reviewer")]);
     expect((await pool.query("SELECT body,salt FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0]).toEqual(before);
-    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(2);
+    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(3);
+    expect((await pool.query("SELECT withheld_pending_review,erased_reason FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0]).toEqual({ withheld_pending_review: false, erased_reason: REVIEWED_WITHHOLD_REASON });
     expect((await pool.query("SELECT status FROM moderation_reports")).rows[0].status).toBe("withheld");
     const exported = await (await bodiesFile(request(`/p/${slug}/bodies.jsonl`), { params: Promise.resolve({ slug }) })).text();
     expect(exported).not.toContain("Original post"); expect(exported).not.toContain(data.details);
@@ -153,8 +178,12 @@ describe.skipIf(!testUrl)("private report workflow (PostgreSQL integration)", ()
   it("leaves reports arriving after the review snapshot pending", async () => {
     const first = input(); await submitReport(first);
     const later = input(); await submitReport(later);
-    await resolveReports({ entry_id: entry.id, report_ids: [first.id], decision: "keep" }, "reviewer");
+    const result = await resolveReports({ entry_id: entry.id, report_ids: [first.id], decision: "restore" }, "reviewer");
+    expect(result).toMatchObject({ pending_reports_remaining: true });
+    expect((await pool.query("SELECT erased_at FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0].erased_at).not.toBeNull();
     expect((await pendingReports()).entries[0].reports.map((r: {id: string}) => r.id)).toEqual([later.id]);
+    await resolveReports({ entry_id: entry.id, report_ids: [later.id], decision: "restore" }, "reviewer");
+    expect((await pool.query("SELECT erased_at FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0].erased_at).toBeNull();
   });
 
   it("rolls back withholding and the chain if saving the private decision fails", async () => {
@@ -163,8 +192,8 @@ describe.skipIf(!testUrl)("private report workflow (PostgreSQL integration)", ()
       CREATE TRIGGER fail_report BEFORE UPDATE ON moderation_reports FOR EACH ROW EXECUTE FUNCTION fail_report_update()`);
     try {
       await expect(resolveReports({ entry_id: entry.id, report_ids: [data.id], decision: "withhold" }, "reviewer")).rejects.toThrow("test failure");
-      expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(1);
-      expect((await pool.query("SELECT erased_at FROM entry_bodies")).rows[0].erased_at).toBeNull();
+      expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(2);
+      expect((await pool.query("SELECT erased_reason,withheld_pending_review FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0]).toEqual({ erased_reason: PENDING_REVIEW_REASON, withheld_pending_review: true });
       expect((await pool.query("SELECT status FROM moderation_reports")).rows[0].status).toBe("pending");
     } finally { await pool.query("DROP TRIGGER fail_report ON moderation_reports; DROP FUNCTION fail_report_update()"); }
   });
@@ -173,5 +202,40 @@ describe.skipIf(!testUrl)("private report workflow (PostgreSQL integration)", ()
     redisState.fail = true;
     expect((await report(request("/api/reports", input()))).status).toBe(503);
     expect((await pool.query("SELECT * FROM moderation_reports")).rows).toHaveLength(0);
+  });
+
+  it("rolls back the report, hiding, and chain together if recording the action fails", async () => {
+    await pool.query(`CREATE FUNCTION fail_auto_hide() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'auto hide failure'; END $$;
+      CREATE TRIGGER fail_auto_hide BEFORE INSERT ON moderation_log FOR EACH ROW EXECUTE FUNCTION fail_auto_hide()`);
+    try {
+      await expect(submitReport(input())).rejects.toThrow("auto hide failure");
+      expect((await pool.query("SELECT * FROM moderation_reports")).rows).toHaveLength(0);
+      expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(1);
+      expect((await pool.query("SELECT erased_at FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0].erased_at).toBeNull();
+    } finally { await pool.query("DROP TRIGGER fail_auto_hide ON moderation_log; DROP FUNCTION fail_auto_hide()"); }
+  });
+
+  it("serializes concurrent reports and restore/report races without exposing unreviewed content", async () => {
+    const reports = [input(), input(), input()];
+    await Promise.all(reports.map(submitReport));
+    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(2);
+    const fresh = input();
+    await Promise.all([
+      resolveReports({ entry_id: entry.id, report_ids: reports.map((r) => r.id), decision: "restore" }, "reviewer"),
+      submitReport(fresh),
+    ]);
+    const body = (await pool.query("SELECT erased_at,withheld_pending_review FROM entry_bodies WHERE entry_id=$1", [entry.id])).rows[0];
+    expect(body.erased_at).not.toBeNull(); expect(body.withheld_pending_review).toBe(true);
+    expect((await pendingReports()).entries[0].reports.map((r: { id: string }) => r.id)).toEqual([fresh.id]);
+  });
+
+  it("backfills existing pending reports once and does not affect dismissed reports", async () => {
+    const data = input();
+    await pool.query("INSERT INTO moderation_reports(id,entry_id,reason,details) VALUES($1,$2,$3,$4)", [data.id, data.entry_id, data.reason, data.details]);
+    expect(await hidePendingReports()).toBe(1);
+    expect(await hidePendingReports()).toBe(0);
+    expect((await pool.query("SELECT * FROM entries")).rows).toHaveLength(2);
+    await resolveReports({ entry_id: entry.id, report_ids: [data.id], decision: "restore" }, "reviewer");
+    expect(await hidePendingReports()).toBe(0);
   });
 });

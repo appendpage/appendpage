@@ -48,7 +48,9 @@ Content that violates these rules may be withheld following review. The original
 
 ## How to remove your post (or report something)
 
-Click **Report** beside the post or reply, choose a reason, and add context if useful. Only the moderator can see the request. Reports are reviewed by a person; report counts do not automatically hide posts. For a removal request about your own post, choose **Something else** and explain the request.
+Click **Report** beside the post or reply, choose a reason, and add context if useful. Reporting immediately hides the post with the message “Content temporarily hidden pending moderation review.” Your reason and explanation stay private. For a removal request about your own post, choose **Something else** and explain the request.
+
+The moderator receives an email notification and can restore the post or keep it withheld after review. A new report hides a restored post again. Hiding and restoration are recorded publicly; the original text and salt are preserved privately throughout review.
 
 If content is withheld, the website and future exports stop serving its body, while the chain retains the original commitment and a public moderation record. Copies downloaded earlier and earlier mirror revisions may still contain it.
 

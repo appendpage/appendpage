@@ -75,7 +75,7 @@ const SPEC = {
     {
       method: "POST",
       path: "/api/reports",
-      summary: "Submit a private moderation request. No login; rate-limited. Does not change public content.",
+      summary: "Submit a private report and immediately hide the post pending review. No login; rate-limited. Every new report can hide a restored post; retries are idempotent.",
       request: {
         type: "object", additionalProperties: false,
         required: ["id", "page", "entry_id", "reason"],
@@ -87,7 +87,7 @@ const SPEC = {
           details: { type: "string", maxLength: 2000 },
         },
       },
-      response_202: { type: "object", properties: { ok: { const: true } } },
+      response_202: { type: "object", properties: { ok: { const: true }, withheld: { type: "boolean", description: "Whether the post is currently hidden. A retry after restoration returns false." } } },
     },
     {
       method: "POST",
